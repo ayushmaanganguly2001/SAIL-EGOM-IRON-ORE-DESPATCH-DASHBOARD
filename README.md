@@ -1,6 +1,6 @@
 # SAIL-EGOM-IRON ORE-DESPATCH-DASHBOARD
 
-A **Streamlit-powered interactive dashboard** for tracking and analyzing daily iron ore despatch performance data from SAIL (Steel Authority of India Limited) Eastern Ghats Open Mines (EGOM).
+A **Streamlit-powered interactive dashboard** for tracking and analyzing daily iron ore despatch performance data from SAIL (Steel Authority of India Limited) Eastern Group Of Mines (EGOM).
 
 ## 🎯 Features
 
