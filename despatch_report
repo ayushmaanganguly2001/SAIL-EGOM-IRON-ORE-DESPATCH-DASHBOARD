@@ -1,0 +1,2132 @@
+#!/usr/bin/env python3
+"""
+Despatch Performance Report  (SAIL - EGOM - Iron Ore)
+====================================================
+
+Parses the daily "Despatch Performance" WhatsApp messages (iron ore rake
+despatch) from .docx / .txt exports and produces a performance report.
+
+What it reads from each message
+-------------------------------
+    Total Rakes                     -> day's despatch
+    Daily COD Plan // Current Mth Avg : 22.09 // 19.00
+                                    -> day's COD plan and running month avg
+    Cumulative: 19 Rakes            -> month-to-date as stated in the message
+    KBR(4): (Daily COD Plan- 2.84)  -> per-mine rakes AND per-mine COD plan
+      (1 L+2 F)BSL / 1FRSP          -> per-mine destination split (mine -> plant)
+    Jharkhand / Odisha Group        -> group rakes with Lump/Fines split
+    Plant Distribution              -> BSL/DSP/RSP/ISP/BSP/Sales/Pellets
+      Pellets : [1FBSL,1FRSP,...]   -> pellet rakes by receiving plant a/c
+    Rake Types                      -> BOXN / BOYN / BOBSN / GPWIS etc.
+    KTR : BSL (2 Rakes)             -> Kuteshwar
+    Remarks ::                      -> reasons for shortfall
+
+Reporting conventions
+---------------------
+  * Financial year runs 1 April to 31 March and is labelled F.Y.2025-2026.
+  * Q1 of F.Y.2025-2026 is April-2025 to June-2025.
+  * Weeks run strictly Sunday to Saturday and never cross a month boundary,
+    so a month beginning or ending mid-week has a short first/last week.
+  * Rakes/day for a month uses the calendar days of that month.
+
+Usage
+-----
+    python despatch_report.py messages.docx
+    python despatch_report.py messages.docx --month 2026-08
+    python despatch_report.py messages.docx --fy 2026
+    python despatch_report.py messages.docx --excel aug26.xlsx
+    python despatch_report.py --selftest        # verify the parser
+
+Dependencies: standard library only. Optional: openpyxl (--excel),
+matplotlib (--charts).
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import csv
+import os
+import re
+import sys
+import zipfile
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+
+# ---------------------------------------------------------------------------
+# Reference data (display only - safe to edit)
+# ---------------------------------------------------------------------------
+
+MINE_NAMES = {
+    "MPR": "Manoharpur", "GUA": "Gua", "KBR": "Kiriburu",
+    "MBR": "Meghataburu", "BOL": "Bolani", "BAR": "Barsuan",
+    "TAL": "Taldih", "KAL": "Kalta",
+}
+
+# Reporting order requested by EGOM: Jharkhand group first, then Odisha.
+MINE_ORDER = ["MPR", "GUA", "KBR", "MBR", "BOL", "BAR", "TAL", "KAL"]
+
+MINE_GROUP = {
+    "MPR": "Jharkhand", "GUA": "Jharkhand", "KBR": "Jharkhand",
+    "MBR": "Jharkhand", "BOL": "Odisha", "BAR": "Odisha",
+    "TAL": "Odisha", "KAL": "Odisha",
+}
+
+# Mines reported with a sales / pellets sub-split when the message carries it.
+SPLIT_MINES = ["BOL", "BAR", "KAL"]
+
+PLANT_NAMES = {
+    "BSL": "Bokaro", "DSP": "Durgapur", "RSP": "Rourkela",
+    "ISP": "Burnpur (ISP)", "BSP": "Bhilai",
+    "OTH": "Other / Sales", "Sales": "Sales", "Pellets": "Pellets",
+}
+CORE_PLANTS = ["BSL", "DSP", "RSP", "ISP", "BSP"]
+CONVERSION_PLANTS = ["Sales", "Pellets"]
+PLANT_KEYS = CORE_PLANTS + CONVERSION_PLANTS
+
+# Destination codes that may appear under a mine or a rake-type line.
+# OTH = "others", i.e. pellets + sales conversion rather than a plant.
+# SLS / PLT are honoured too, for the day when a message names them per mine.
+DEST_CODES = set(CORE_PLANTS) | {"OTH", "SLS", "PLT"}
+OTHERS_COL = "Others (pellets + sales)"
+
+# Rake types as reported by EGOM, in reporting order.
+RAKE_TYPES = [
+    "Pvt. GPWIS BOXN/BOXNHL",
+    "SAIL GPWIS BOXNHL",
+    "SAIL GPWIS BOBSNM",
+    "SAIL GPWIS BOSTHSM",
+    "BOXN/BOXNHL",
+    "BOBSNM",
+    "BOYN/BOYEL",
+    "BOSM",
+    "BOST",
+]
+
+# Wagon families, longest tag first so BOXNHL wins over BOXN.
+_WAGON_FAMILIES = [
+    ("BOSTHSM", "BOST"), ("BOST", "BOST"),
+    ("BOXNHL", "BOXN/BOXNHL"), ("BOXN", "BOXN/BOXNHL"),
+    ("BOBSNM", "BOBSNM"), ("BOBSN", "BOBSNM"),
+    ("BOYEL", "BOYN/BOYEL"), ("BOYN", "BOYN/BOYEL"),
+    ("BOSM", "BOSM"),
+]
+
+DAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def canonical_rake_type(raw: str) -> str:
+    """Fold a reported rake-type name onto the EGOM reporting vocabulary.
+
+    "BOXN", "BOXNHL" -> "BOXN/BOXNHL";  "SAIL GPWIS BOBSN" -> the SAIL GPWIS
+    BOBSNM line. Names that cannot be placed are returned tidied but unchanged,
+    so an unfamiliar type stays visible instead of being folded into the wrong
+    bucket.
+    """
+    name = re.sub(r"\s+", " ", raw).strip()
+    upper = name.upper().replace(".", "")
+    family = next((canon for tag, canon in _WAGON_FAMILIES if tag in upper), "")
+
+    if "PVT" in upper:
+        return "Pvt. GPWIS BOXN/BOXNHL" if family in ("", "BOXN/BOXNHL") \
+            else f"Pvt. GPWIS {family}"
+    if "SAIL" in upper:
+        if family == "BOXN/BOXNHL":
+            return "SAIL GPWIS BOXNHL"
+        if family == "BOBSNM":
+            return "SAIL GPWIS BOBSNM"
+        if family == "BOST":
+            return "SAIL GPWIS BOSTHSM"
+        return f"SAIL GPWIS {family}".strip() if family else name
+    return family or name
+
+# ---------------------------------------------------------------------------
+# PATTERNS
+# ---------------------------------------------------------------------------
+
+DATE_RE = re.compile(r"(\d{1,2})-([A-Za-z]+)-(\d{4})")
+TOTAL_RE = re.compile(r"Total\s+Rakes\s*[:\-]?\s*(\d+(?:\.\d+)?)", re.I)
+
+# "Daily COD Plan // Current Mth Avg : 22.09 // 19.00Rakes"
+DAY_PLAN_RE = re.compile(
+    r"Daily\s*COD\s*Plan\s*/{1,2}\s*Current\s*Mth\s*Avg\s*[:\-]?\s*"
+    r"([\d.]+)\s*/{1,2}\s*([\d.]+)", re.I)
+
+CUMULATIVE_RE = re.compile(r"Cumulative\s*[:\-]?\s*([\d.]+)\s*Rakes", re.I)
+
+# Per-mine line: "KBR(4):   (Daily COD Plan- 2.84 Rakes)"
+MINE_RE = re.compile(r"^([A-Z]{3})\s*\(\s*(\d+)\s*\)\s*:")
+COD_INLINE_RE = re.compile(r"Daily\s*COD\s*Plan\s*[:\-]?\s*([\d.]+)", re.I)
+
+# "Jharkhand Group of Mines  : 1.44L+6.56F: 8.00 Rakes"
+GROUP_RE = re.compile(
+    r"^(Jharkhand|Odisha)\s+Group\s+of\s+Mines\s*[:\-]?\s*"
+    r"([\d.]+)\s*L\s*\+\s*([\d.]+)\s*F\s*[:\-]?\s*([\d.]+)\s*Rakes", re.I)
+
+# "BSL : 1.00L+3.00F: 4 Rakes   (Daily COD Plan : 4.61 Rakes)"
+PLANT_LF_RE = re.compile(
+    r"^(BSL|DSP|RSP|ISP|BSP)\s*[:\-]\s*([\d.]+)\s*L\s*\+\s*([\d.]+)\s*F\s*"
+    r"[:\-]?\s*([\d.]+)\s*Rakes", re.I)
+
+# "Sales: [2F OTH] : 2 Rakes" / "Pellets : [1FBSL,,1FRSP,2FISP,1FBSP] : 5 Rakes"
+PLANT_OTHER_RE = re.compile(r"^(Sales?|Pellets?)\s*[:\-]", re.I)
+# The same label under a mine: "Pellets :  1FBSL  1FRSP  2FISP", "Sales: 2F OTH".
+MINE_CONV_RE = PLANT_OTHER_RE
+RAKES_RE = re.compile(r"([\d.]+)\s*Rakes", re.I)
+
+# Mine -> plant allocation tokens, e.g. "(1  L+2  F)BSL" and "1FRSP".
+ALLOC_LF_RE = re.compile(
+    r"\(\s*([\d.]*)\s*[Ll]\s*\+\s*([\d.]*)\s*[Ff]\s*\)\s*P?([A-Za-z]{3})")
+ALLOC_SIMPLE_RE = re.compile(r"([\d.]+)\s*([LlFf])\s*P?\s*([A-Za-z]{3})")
+
+# Rake types: "SAIL GPWIS BOST(1) 1BSL", "Pvt. GPWIS(7) ...", "BOBSN(5) ..."
+RAKE_TYPE_RE = re.compile(r"^([A-Za-z][A-Za-z.\s/]*?)\s*\(\s*(\d+)\s*\)")
+
+# Plant split on a rake-type line: "|2OTH|1PBSL|1PRSP|2PISP|1PBSP", "4BSL".
+# A leading P marks a private wagon and is not part of the plant code.
+RAKE_DEST_RE = re.compile(r"(\d+(?:\.\d+)?)\s*P?\s*([A-Za-z]{3})")
+
+# "KTR : BSL (2 Rakes )"  /  "KTR : NIL (Nil Rakes )"
+KTR_RE = re.compile(r"^KTR\s*[:\-]?\s*(.*?)\s*\(\s*\*?\s*([\d.]+|Nil)\s*Rakes",
+                    re.I)
+
+MONTHS = ["January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
+_MONTH_LOOKUP = {m[:3].lower(): i + 1 for i, m in enumerate(MONTHS)}
+
+
+# ---------------------------------------------------------------------------
+# Financial-year / week helpers
+# ---------------------------------------------------------------------------
+
+def fy_start_year(d: date) -> int:
+    """Calendar year in which the financial year containing `d` began."""
+    return d.year if d.month >= 4 else d.year - 1
+
+
+def fy_label(d: date) -> str:
+    y = fy_start_year(d)
+    return f"F.Y.{y}-{y + 1}"
+
+
+def fy_quarter(d: date) -> int:
+    """1 for Apr-Jun, 2 for Jul-Sep, 3 for Oct-Dec, 4 for Jan-Mar."""
+    return (d.month - 4) % 12 // 3 + 1
+
+
+def quarter_label(d: date) -> str:
+    return f"Q{fy_quarter(d)} {fy_label(d)}"
+
+
+def month_label(d: date) -> str:
+    return f"{MONTHS[d.month - 1][:3]}-{d.year % 100:02d}"
+
+
+def fiscal_month_index(d: date) -> int:
+    """0 for April ... 11 for March - used for FY-wise ordering."""
+    return (d.month - 4) % 12
+
+
+def month_days(d: date) -> int:
+    return calendar.monthrange(d.year, d.month)[1]
+
+
+def week_bounds(d: date) -> tuple[date, date]:
+    """Sunday-to-Saturday week containing `d`, clipped to the month.
+
+    A month that begins on, say, a Friday therefore has a two-day first week,
+    and a month ending on a Sunday has a one-day last week.
+    """
+    # Python: Monday=0 ... Sunday=6. Offset back to the week's Sunday.
+    offset = (d.weekday() + 1) % 7
+    first = d.replace(day=1)
+    last = d.replace(day=month_days(d))
+    start = max(d - timedelta(days=offset), first)
+    end = min(d + timedelta(days=6 - offset), last)
+    return start, end
+
+
+def week_index(d: date) -> int:
+    """1-based index of `d`'s week within its month (weeks start on Sunday)."""
+    idx = 1
+    for day_num in range(2, d.day + 1):
+        if date(d.year, d.month, day_num).weekday() == 6:   # Sunday
+            idx += 1
+    return idx
+
+
+def week_label(d: date) -> str:
+    start, end = week_bounds(d)
+    return (f"W{week_index(d)} ({start.day:02d}-{end.day:02d} "
+            f"{month_label(start)})")
+
+
+# ---------------------------------------------------------------------------
+# Text extraction
+# ---------------------------------------------------------------------------
+
+def extract_text(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    if os.path.splitext(path)[1].lower() == ".docx":
+        return docx_text(path)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def docx_text(path: str) -> str:
+    """Text from a .docx without third-party libraries (a .docx is a zip)."""
+    with zipfile.ZipFile(path) as zf:
+        xml = zf.read("word/document.xml").decode("utf-8", "replace")
+    return docx_xml_to_text(xml)
+
+
+def docx_xml_to_text(xml: str) -> str:
+    xml = re.sub(r"<w:br[^>]*/>", "\n", xml)
+    xml = re.sub(r"</w:p>", "\n", xml)
+    xml = re.sub(r"<w:tab\b[^>]*/?>", "\t", xml)
+    # The tag name must end here, otherwise <w:tbl>, <w:tcPr> and friends match
+    # too and drag raw markup into the text.
+    parts = re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>|(\n)", xml, flags=re.S)
+    text = "".join(a or b for a, b in parts)
+    for entity, char in (("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                         ("&quot;", '"'), ("&apos;", "'")):
+        text = text.replace(entity, char)
+    return text
+
+
+def _num(token, default: float = 0.0) -> float:
+    """Hand-typed messages carry stray dots, so never let float() abort a parse."""
+    try:
+        return float(token)
+    except (TypeError, ValueError):
+        try:
+            return float(re.sub(r"\.(?=.*\.)|\.$", "", str(token)))
+        except ValueError:
+            return default
+
+
+def clean(text: str) -> str:
+    """Remove WhatsApp formatting markers and odd spaces."""
+    text = text.replace(" ", " ").replace("​", "")
+    text = text.replace("```", "")            # code fences round dates/plans
+    text = re.sub(r"[*~]+", "", text)         # bold / strike markers
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Mine:
+    code: str
+    rakes: int = 0
+    cod: float = 0.0
+    dest: dict[str, float] = field(default_factory=dict)   # plant -> rakes
+    lump: float = 0.0
+    fines: float = 0.0
+    others: float = 0.0       # an OTH tag with no Sales/Pellets label
+    sales: float = 0.0        # from the mine's own "Sales:" line
+    pellets: float = 0.0      # from the mine's own "Pellets :" line
+    # Plant a/c behind the conversion, e.g. Pellets : 1FBSL 1FRSP 2FISP.
+    pellet_accounts: dict[str, float] = field(default_factory=dict)
+    sales_accounts: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def name(self) -> str:
+        return MINE_NAMES.get(self.code, self.code)
+
+    @property
+    def direct(self) -> float:
+        """Rakes sent straight to a plant, i.e. excluding sales and pellets."""
+        return round(sum(self.dest.values()), 2)
+
+    @property
+    def conversion(self) -> float:
+        return round(self.sales + self.pellets + self.others, 2)
+
+    @property
+    def allocated(self) -> float:
+        return round(self.direct + self.conversion, 2)
+
+    @property
+    def unallocated(self) -> float:
+        return round(self.rakes - self.allocated, 2)
+
+
+@dataclass
+class Plant:
+    code: str
+    rakes: float = 0.0
+    lump: float = 0.0
+    fines: float = 0.0
+    cod: float = 0.0
+    accounts: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class Record:
+    day: date
+    label: str
+    raw: str = ""
+    total: float = 0.0                      # Total Rakes
+    plan: float = 0.0                       # day's COD plan
+    mth_avg: float = 0.0                    # month avg as stated
+    cumulative: float = 0.0                 # MTD as stated in the message
+    mines: dict[str, Mine] = field(default_factory=dict)
+    groups: dict[str, dict] = field(default_factory=dict)
+    plants: dict[str, Plant] = field(default_factory=dict)
+    rake_types: dict[str, int] = field(default_factory=dict)
+    rake_type_dest: dict[str, dict[str, float]] = field(default_factory=dict)
+    ktr_dest: str = ""
+    ktr_rakes: float = 0.0
+    remarks: list[str] = field(default_factory=list)
+    unparsed: list[str] = field(default_factory=list)
+
+    # ---- calendar ---------------------------------------------------------
+    @property
+    def month_key(self) -> str:
+        return f"{self.day.year}-{self.day.month:02d}"
+
+    @property
+    def month_name(self) -> str:
+        return month_label(self.day)
+
+    @property
+    def day_name(self) -> str:
+        """Mon / Tue / ... - fixed English abbreviations, locale independent."""
+        return DAY_ABBR[self.day.weekday()]
+
+    @property
+    def fy(self) -> str:
+        return fy_label(self.day)
+
+    @property
+    def quarter(self) -> str:
+        return quarter_label(self.day)
+
+    @property
+    def week(self) -> str:
+        return week_label(self.day)
+
+    @property
+    def week_key(self) -> tuple:
+        start, _ = week_bounds(self.day)
+        return (start.year, start.month, start.day)
+
+    # ---- performance ------------------------------------------------------
+    @property
+    def variance(self) -> float:
+        return self.total - self.plan
+
+    @property
+    def achievement(self) -> float | None:
+        return (self.total / self.plan * 100) if self.plan else None
+
+    @property
+    def core_plant_total(self) -> float:
+        return round(sum(p.rakes for c, p in self.plants.items()
+                         if c in CORE_PLANTS), 2)
+
+    @property
+    def conversion_total(self) -> float:
+        return round(sum(p.rakes for c, p in self.plants.items()
+                         if c in CONVERSION_PLANTS), 2)
+
+    @property
+    def sales_rakes(self) -> float:
+        p = self.plants.get("Sales")
+        return p.rakes if p else 0.0
+
+    @property
+    def pellet_rakes(self) -> float:
+        p = self.plants.get("Pellets")
+        return p.rakes if p else 0.0
+
+    @property
+    def pellet_accounts(self) -> dict[str, float]:
+        p = self.plants.get("Pellets")
+        return dict(p.accounts) if p else {}
+
+    @property
+    def sales_accounts(self) -> dict[str, float]:
+        p = self.plants.get("Sales")
+        return dict(p.accounts) if p else {}
+
+    # ---- data quality -----------------------------------------------------
+    def notes(self) -> list[str]:
+        """Explanations, not errors - shown separately from checks()."""
+        out = []
+        if self.plants and self.total:
+            gap = round(self.total - self.core_plant_total, 2)
+            if abs(gap) > 0.01 and abs(gap - self.conversion_total) <= 0.01:
+                bits = []
+                if self.sales_rakes:
+                    bits.append(f"sales {self.sales_rakes:g}")
+                if self.pellet_rakes:
+                    bits.append(f"pellets {self.pellet_rakes:g}")
+                out.append(
+                    f"{gap:g} of {self.total:g} rakes routed as conversion "
+                    f"({', '.join(bits) or 'unspecified'}); direct plant "
+                    f"despatch {self.core_plant_total:g}")
+        if self.pellet_accounts:
+            named = ", ".join(f"{k} {v:g}"
+                              for k, v in sorted(self.pellet_accounts.items()))
+            out.append(f"pellet conversion by plant a/c: {named}")
+        for code, mine in self.mines.items():
+            if not mine.conversion:
+                continue
+            bits = []
+            if mine.sales:
+                bits.append(f"sales {mine.sales:g}")
+            if mine.pellets:
+                acc = ", ".join(f"{k} {v:g}" for k, v in
+                                sorted(mine.pellet_accounts.items()))
+                bits.append(f"pellets {mine.pellets:g}"
+                            + (f" (a/c {acc})" if acc else ""))
+            if mine.others:
+                bits.append(f"others {mine.others:g}")
+            out.append(f"{mine.name}: {mine.rakes:g} rakes = "
+                       f"{mine.direct:g} direct + " + " + ".join(bits))
+        return out
+
+    def checks(self) -> list[str]:
+        """Internal consistency of the message itself.
+
+        Total Rakes is expected to equal direct plant despatch PLUS sales and
+        pellets conversion. A gap between Total Rakes and the core plant lines
+        alone is normal and is reported by notes(), not here.
+        """
+        issues = []
+        mine_sum = sum(m.rakes for m in self.mines.values())
+        if self.total and mine_sum != self.total:
+            issues.append(f"mine total {mine_sum:g} != Total Rakes {self.total:g}")
+
+        if self.total and self.plants:
+            core, conv = self.core_plant_total, self.conversion_total
+            if abs(core + conv - self.total) > 0.01:
+                issues.append(
+                    f"plant distribution {core:g} direct + {conv:g} conversion "
+                    f"= {core + conv:g} != Total Rakes {self.total:g}")
+
+        # Pellet bracket detail should add up to the Pellets line.
+        pel = self.plants.get("Pellets")
+        if pel and pel.accounts:
+            named = round(sum(pel.accounts.values()), 2)
+            if abs(named - pel.rakes) > 0.01:
+                issues.append(f"pellet plant a/c detail {named:g} != "
+                              f"Pellets {pel.rakes:g}")
+
+        for code, mine in self.mines.items():
+            if (mine.dest or mine.conversion) and mine.unallocated:
+                issues.append(
+                    f"{code} destination split {mine.allocated:g} "
+                    f"({mine.direct:g} direct + {mine.conversion:g} conversion) "
+                    f"!= {mine.rakes:g} rakes "
+                    f"({mine.unallocated:g} unaccounted)")
+
+        # The mine lines and the plant distribution are two statements of the
+        # same day, so each side should reconcile with the other.
+        for key, attr in (("Sales", "sales"), ("Pellets", "pellets")):
+            stated = self.plants.get(key)
+            from_mines = round(sum(getattr(m, attr)
+                                   for m in self.mines.values()), 2)
+            if stated and from_mines and abs(from_mines - stated.rakes) > 0.01:
+                issues.append(f"{key.lower()} under the mines {from_mines:g} != "
+                              f"{key} in plant distribution {stated.rakes:g}")
+
+        by_plant: dict[str, float] = defaultdict(float)
+        for mine in self.mines.values():
+            for plant, qty in mine.dest.items():
+                by_plant[plant] += qty
+        for plant, qty in sorted(by_plant.items()):
+            stated = self.plants.get(plant)
+            if stated and abs(round(qty, 2) - stated.rakes) > 0.01:
+                issues.append(f"{plant} from the mine lines {qty:g} != "
+                              f"{plant} in plant distribution "
+                              f"{stated.rakes:g}")
+
+        # A rake-type line's plant split should add up to its bracketed count.
+        for name, count in self.rake_types.items():
+            split = round(sum(self.rake_type_dest.get(name, {}).values()), 2)
+            if split and abs(split - count) > 0.01:
+                issues.append(f"rake type {name} plant split {split:g} != "
+                              f"{count:g} rakes")
+
+        if not self.total:
+            issues.append("Total Rakes not found")
+        if not self.plan:
+            issues.append("Daily COD Plan not found")
+        if not self.mines:
+            issues.append("no mine lines found")
+        return issues
+
+
+def _parse_date(m: re.Match) -> date | None:
+    month = _MONTH_LOOKUP.get(m.group(2)[:3].lower())
+    if not month:
+        return None
+    try:
+        return date(int(m.group(3)), month, int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def parse_records(text: str) -> list[Record]:
+    """Split the dump into one Record per 'D-Month-YYYY' heading."""
+    lines = clean(text).split("\n")
+    chunks: list[tuple[date, str, list[str]]] = []
+    for line in lines:
+        m = DATE_RE.search(line)
+        day = _parse_date(m) if m else None
+        if day:
+            chunks.append((day, m.group(0), [line]))
+        elif chunks:
+            chunks[-1][2].append(line)
+
+    records = [_build(day, label, "\n".join(buf)) for day, label, buf in chunks]
+    # A re-sent or corrected message for the same date supersedes the earlier one.
+    return sorted({r.day: r for r in records}.values(), key=lambda r: r.day)
+
+
+def _parse_allocations(text: str) -> list[tuple[str, float, float]]:
+    """Destination tokens on a line under a mine.
+
+    Returns (plant code, lump, fines) triples. Handles both "(1 L+2 F)BSL"
+    and bare "1FRSP" / "2LBSL" forms, and several tokens on one line.
+    """
+    found: list[tuple[str, float, float]] = []
+    rest = text
+
+    for m in ALLOC_LF_RE.finditer(text):
+        code = m.group(3).upper()
+        if code in DEST_CODES:
+            lump = _num(m.group(1)) if m.group(1) else 0.0
+            fines = _num(m.group(2)) if m.group(2) else 0.0
+            found.append((code, lump, fines))
+        rest = rest.replace(m.group(0), " ")
+
+    for m in ALLOC_SIMPLE_RE.finditer(rest):
+        code = m.group(3).upper()
+        if code not in DEST_CODES:
+            continue
+        qty = _num(m.group(1))
+        if m.group(2).upper() == "L":
+            found.append((code, qty, 0.0))
+        else:
+            found.append((code, 0.0, qty))
+    return found
+
+
+def _add_allocations(mine: Mine, allocs: list[tuple[str, float, float]]) -> None:
+    """Direct plant despatch under a mine: '(1 L+2 F)BSL', '1FRSP'."""
+    for code, lump, fines in allocs:
+        qty = lump + fines
+        mine.lump = round(mine.lump + lump, 2)
+        mine.fines = round(mine.fines + fines, 2)
+        # An untagged OTH is conversion of an unstated kind, not a plant.
+        if code == "OTH":
+            mine.others = round(mine.others + qty, 2)
+        elif code == "SLS":
+            mine.sales = round(mine.sales + qty, 2)
+            mine.sales_accounts["OTH"] = round(
+                mine.sales_accounts.get("OTH", 0.0) + qty, 2)
+        elif code == "PLT":
+            mine.pellets = round(mine.pellets + qty, 2)
+            # No plant a/c is named on a bare PLT tag, so book it to OTH the
+            # same way an SLS tag is booked, or the rakes would disappear
+            # from the mine-wise pellet a/c table.
+            mine.pellet_accounts["OTH"] = round(
+                mine.pellet_accounts.get("OTH", 0.0) + qty, 2)
+        else:
+            mine.dest[code] = round(mine.dest.get(code, 0.0) + qty, 2)
+
+
+def _add_conversion(mine: Mine, kind: str, text: str) -> float:
+    """A mine's own 'Pellets :  1FBSL  1FRSP  2FISP' or 'Sales: 2F OTH' line.
+
+    These rakes are part of the mine's total but are NOT direct plant
+    despatch - the plant codes name the account the conversion is booked to.
+    Returns the rakes read off the line.
+    """
+    allocs = _parse_allocations(text)
+    qty = round(sum(lump + fines for _c, lump, fines in allocs), 2)
+    if not qty:                       # e.g. "Pellets : 4 Rakes"
+        nums = RAKES_RE.findall(text) or re.findall(r"([\d.]+)", text)
+        qty = _num(nums[-1]) if nums else 0.0
+    accounts = (mine.pellet_accounts if kind == "pellets"
+                else mine.sales_accounts)
+    for code, lump, fines in allocs:
+        accounts[code] = round(accounts.get(code, 0.0) + lump + fines, 2)
+        mine.lump = round(mine.lump + lump, 2)
+        mine.fines = round(mine.fines + fines, 2)
+    if kind == "pellets":
+        mine.pellets = round(mine.pellets + qty, 2)
+    else:
+        mine.sales = round(mine.sales + qty, 2)
+    return qty
+
+
+def _build(day: date, label: str, raw: str) -> Record:
+    rec = Record(day=day, label=label, raw=raw.strip())
+    section = ""
+    current: Mine | None = None
+
+    for line in raw.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+
+        # --- section switches ---------------------------------------------
+        if low.startswith("plant distribution"):
+            section, current = "plant", None
+            continue
+        if low.startswith("rake type"):
+            section, current = "rake", None
+            continue
+        if low.startswith("remarks"):
+            section, current = "remarks", None
+            continue
+        if low.startswith("regards"):
+            section, current = "", None
+            continue
+
+        # --- day totals ----------------------------------------------------
+        if not rec.total:
+            m = TOTAL_RE.search(s)
+            if m:
+                rec.total = _num(m.group(1))
+                continue
+
+        m = DAY_PLAN_RE.search(s)
+        if m:
+            rec.plan = _num(m.group(1))
+            rec.mth_avg = _num(m.group(2))
+            current = None
+            continue
+
+        m = CUMULATIVE_RE.search(s)
+        if m and "cumulative" in low:
+            rec.cumulative = _num(m.group(1))
+            current = None
+            continue
+
+        m = GROUP_RE.match(s)
+        if m:
+            rec.groups[m.group(1).title()] = {
+                "lump": _num(m.group(2)), "fines": _num(m.group(3)),
+                "rakes": _num(m.group(4)),
+            }
+            current = None
+            continue
+
+        m = KTR_RE.match(s)
+        if m:
+            rec.ktr_dest = m.group(1).strip(" :") or "NIL"
+            val = m.group(2)
+            rec.ktr_rakes = 0.0 if val.lower() == "nil" else _num(val)
+            current = None
+            continue
+
+        # --- mines (anywhere) ---------------------------------------------
+        m = MINE_RE.match(s)
+        if m:
+            code, rakes = m.group(1), int(m.group(2))
+            cod_m = COD_INLINE_RE.search(s)
+            mine = rec.mines.get(code) or Mine(code)
+            mine.rakes += rakes
+            if cod_m:
+                mine.cod = _num(cod_m.group(1))
+            rec.mines[code] = mine
+            current = mine
+            # Destinations sometimes sit on the mine line itself; ignore the
+            # "(Daily COD Plan ...)" tail so the plan is never read as a rake.
+            head = s[:cod_m.start()] if cod_m else s
+            _add_allocations(mine, _parse_allocations(head[m.end():]))
+            continue
+
+        # --- a mine's own sales / pellets conversion lines -------------------
+        # "Pellets :  1FBSL  1FRSP  2FISP" or "Sales: 2F OTH" sitting under a
+        # mine. These are the mine's rakes but not direct plant despatch, so
+        # they must be read before the generic destination handling below.
+        if section == "" and current is not None:
+            m = MINE_CONV_RE.match(s)
+            if m:
+                kind = ("pellets" if m.group(1).lower().startswith("pell")
+                        else "sales")
+                _add_conversion(current, kind, s[m.end():])
+                continue
+
+        # --- plant distribution -------------------------------------------
+        if section == "plant":
+            m = PLANT_LF_RE.match(s)
+            if m:
+                cod_m = COD_INLINE_RE.search(s)
+                rec.plants[m.group(1).upper()] = Plant(
+                    code=m.group(1).upper(), lump=_num(m.group(2)),
+                    fines=_num(m.group(3)), rakes=_num(m.group(4)),
+                    cod=_num(cod_m.group(1)) if cod_m else 0.0)
+                continue
+            if PLANT_OTHER_RE.match(s) and COD_INLINE_RE.search(s):
+                key = "Sales" if s.lower().startswith("sale") else "Pellets"
+                cod_m = COD_INLINE_RE.search(s)
+                # Strip the "(Daily COD Plan ...)" part before reading rakes,
+                # so the plan figure is never mistaken for the actual.
+                head = s[:cod_m.start()]
+                head = head.rsplit("(", 1)[0] if "(" in head[-30:] else head
+                nums = RAKES_RE.findall(head)
+                rec.plants[key] = Plant(
+                    code=key,
+                    rakes=_num(nums[-1]) if nums else _bracket_sum(head),
+                    cod=_num(cod_m.group(1)),
+                    accounts=_bracket_accounts(head))
+                continue
+
+        # --- rake types ----------------------------------------------------
+        if section == "rake":
+            m = RAKE_TYPE_RE.match(s)
+            if m:
+                name = canonical_rake_type(m.group(1))
+                rec.rake_types[name] = rec.rake_types.get(name, 0) + int(m.group(2))
+                dest = rec.rake_type_dest.setdefault(name, {})
+                for qty, code in RAKE_DEST_RE.findall(s[m.end():]):
+                    key = code.upper()
+                    if key in DEST_CODES:
+                        dest[key] = round(dest.get(key, 0.0) + _num(qty), 2)
+                continue
+
+        # --- remarks -------------------------------------------------------
+        if section == "remarks":
+            cleaned = re.sub(r"^\d+\s*[.)]\s*", "", s).strip()
+            if cleaned:
+                rec.remarks.append(cleaned)
+            continue
+
+        # --- mine destination lines ----------------------------------------
+        if section == "" and current is not None:
+            allocs = _parse_allocations(s)
+            if allocs:
+                _add_allocations(current, allocs)
+                continue
+
+        # Anything left over is surfaced in the diagnostics so format drift
+        # is visible rather than silently dropped.
+        if section != "remarks" and not DATE_RE.search(s):
+            rec.unparsed.append(f"[{section or 'mines'}] {s}")
+
+    # Fall back to the sum of mines if the header total is missing.
+    if not rec.total and rec.mines:
+        rec.total = float(sum(m.rakes for m in rec.mines.values()))
+    return rec
+
+
+def _bracket_sum(text: str) -> float:
+    """Sum rake counts inside a bracket list, e.g. '[2LOTH+3FOTH]' -> 5."""
+    inner = re.search(r"\[(.*?)\]", text)
+    if not inner:
+        return 0.0
+    return float(sum(_num(n) for n in re.findall(r"([\d.]+)\s*[LFlf]",
+                                                 inner.group(1))))
+
+
+def _bracket_accounts(text: str) -> dict[str, float]:
+    """Plant accounts inside a bracket list: '[1FBSL,,1FRSP,2FISP]'."""
+    inner = re.search(r"\[(.*?)\]", text)
+    if not inner:
+        return {}
+    out: dict[str, float] = {}
+    for qty, _lf, code in re.findall(r"([\d.]+)\s*([LlFf])\s*P?\s*([A-Za-z]{3})",
+                                     inner.group(1)):
+        key = code.upper()
+        if key in DEST_CODES:
+            out[key] = round(out.get(key, 0.0) + _num(qty), 2)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Summary:
+    records: list[Record]
+
+    @property
+    def days(self) -> int:
+        return len(self.records)
+
+    @property
+    def total(self) -> float:
+        return sum(r.total for r in self.records)
+
+    @property
+    def plan(self) -> float:
+        return sum(r.plan for r in self.records)
+
+    @property
+    def cod_pct(self) -> float | None:
+        return (self.total / self.plan * 100) if self.plan else None
+
+    @property
+    def stated_cumulative(self) -> float:
+        return self.records[-1].cumulative if self.records else 0.0
+
+    @property
+    def calendar_days(self) -> int:
+        """Calendar days of every month touched by the selection."""
+        seen = {(r.day.year, r.day.month) for r in self.records}
+        return sum(calendar.monthrange(y, m)[1] for y, m in seen)
+
+    # ---- mine / plant -----------------------------------------------------
+    def mine_rows(self, mine_filter: str | None = None) -> list[dict]:
+        despatch: dict[str, float] = defaultdict(float)
+        cod: dict[str, float] = defaultdict(float)
+        for r in self.records:
+            for code, mine in r.mines.items():
+                if mine_filter and mine_filter.upper() not in code:
+                    continue
+                despatch[code] += mine.rakes
+                cod[code] += mine.cod
+        rows = []
+        for code in sorted(despatch, key=_mine_sort):
+            d, c = despatch[code], cod[code]
+            rows.append({
+                "Mine": code,
+                "Name": MINE_NAMES.get(code, code),
+                "Group": MINE_GROUP.get(code, ""),
+                "Despatch": d,
+                "COD Plan": round(c, 2),
+                "Achievement %": round(d / c * 100, 1) if c else None,
+                "% Share": round(d / self.total * 100, 1) if self.total else 0.0,
+            })
+        return rows
+
+    def plant_rows(self) -> list[dict]:
+        agg: dict[str, dict] = {}
+        for r in self.records:
+            for code, p in r.plants.items():
+                a = agg.setdefault(code, {"rakes": 0.0, "cod": 0.0,
+                                          "lump": 0.0, "fines": 0.0})
+                a["rakes"] += p.rakes
+                a["cod"] += p.cod
+                a["lump"] += p.lump
+                a["fines"] += p.fines
+        rows = []
+        for code in PLANT_KEYS:
+            if code not in agg:
+                continue
+            a = agg[code]
+            rows.append({
+                "Plant": code,
+                "Name": PLANT_NAMES.get(code, code),
+                "Type": "Conversion" if code in CONVERSION_PLANTS else "Direct",
+                "Despatch": round(a["rakes"], 2),
+                "COD Plan": round(a["cod"], 2),
+                "Achievement %": (round(a["rakes"] / a["cod"] * 100, 1)
+                                  if a["cod"] else None),
+                "Lump": round(a["lump"], 2),
+                "Fines": round(a["fines"], 2),
+            })
+        return rows
+
+    def pellet_account_rows(self) -> list[dict]:
+        """Pellet conversion broken down by the receiving plant a/c."""
+        agg: dict[str, float] = defaultdict(float)
+        for r in self.records:
+            for code, qty in r.pellet_accounts.items():
+                agg[code] += qty
+        total = sum(agg.values())
+        return [{"Plant a/c": code,
+                 "Name": PLANT_NAMES.get(code, code),
+                 "Pellet Rakes": round(agg[code], 2),
+                 "% Share": round(agg[code] / total * 100, 1) if total else 0.0}
+                for code in sorted(agg, key=lambda c: -agg[c])]
+
+    def mine_plant_matrix(self) -> tuple[list[dict], list[str]]:
+        """Mine rows x destination columns, with Sales and Pellets.
+
+        The plant columns are direct despatch only. A mine's own "Sales:" and
+        "Pellets :" lines are its conversion rakes, reported in their own
+        columns, so 'Direct' + Sales + Pellets = the mine's Total. The Others
+        column only appears where an OTH tag was given without a Sales or
+        Pellets label.
+        """
+        cols = [c for c in CORE_PLANTS]
+        mine_dest: dict[str, dict[str, float]] = {}
+        mine_total: dict[str, float] = defaultdict(float)
+        mine_sales: dict[str, float] = defaultdict(float)
+        mine_pellets: dict[str, float] = defaultdict(float)
+        mine_others: dict[str, float] = defaultdict(float)
+        for r in self.records:
+            for code, mine in r.mines.items():
+                d = mine_dest.setdefault(code, defaultdict(float))
+                for plant, qty in mine.dest.items():
+                    d[plant] += qty
+                mine_total[code] += mine.rakes
+                mine_sales[code] += mine.sales
+                mine_pellets[code] += mine.pellets
+                mine_others[code] += mine.others
+
+        rows: list[dict] = []
+        for code in sorted(mine_total, key=_mine_sort):
+            d = mine_dest.get(code, {})
+            direct = round(sum(d.values()), 2)
+            row = {"Mine": MINE_NAMES.get(code, code), "Code": code}
+            for c in cols:
+                row[c] = round(d.get(c, 0.0), 2) or None
+            row["Direct"] = direct or None
+            row["Sales"] = round(mine_sales[code], 2) or None
+            row["Pellets"] = round(mine_pellets[code], 2) or None
+            row[OTHERS_COL] = round(mine_others[code], 2) or None
+            allocated = round(direct + mine_sales[code] + mine_pellets[code]
+                              + mine_others[code], 2)
+            row["Unallocated"] = round(mine_total[code] - allocated, 2) or None
+            row["Total"] = round(mine_total[code], 2)
+            rows.append(row)
+
+        plants = {p["Plant"]: p["Despatch"] for p in self.plant_rows()}
+        total_row = {"Mine": "TOTAL", "Code": ""}
+        for c in cols:
+            total_row[c] = plants.get(c) or None
+        total_row["Direct"] = round(sum(plants.get(c, 0.0)
+                                       for c in CORE_PLANTS), 2) or None
+        # Prefer the day's own Sales / Pellets figures from the plant
+        # distribution; fall back to the mine lines when it is absent.
+        total_row["Sales"] = (plants.get("Sales")
+                              or round(sum(mine_sales.values()), 2) or None)
+        total_row["Pellets"] = (plants.get("Pellets")
+                                or round(sum(mine_pellets.values()), 2) or None)
+        total_row[OTHERS_COL] = round(sum(mine_others.values()), 2) or None
+        total_row["Unallocated"] = None
+        total_row["Total"] = round(self.total, 2)
+        rows.append(total_row)
+
+        order = (["Mine"] + cols + ["Direct", "Sales", "Pellets", OTHERS_COL,
+                                    "Unallocated", "Total"])
+        return rows, order
+
+    def mine_conversion_rows(self) -> tuple[list[dict], list[str]]:
+        """The EGOM four-way split, per mine: direct / sales / pellets / total.
+
+        This is the shape the daily message uses for Bolani, Barsuan and Kalta,
+        and it is produced for every mine so the report stays uniform.
+        """
+        agg: dict[str, dict[str, float]] = {}
+        for r in self.records:
+            for code, mine in r.mines.items():
+                a = agg.setdefault(code, {"direct": 0.0, "sales": 0.0,
+                                          "pellets": 0.0, "others": 0.0,
+                                          "total": 0.0, "cod": 0.0})
+                a["direct"] += mine.direct
+                a["sales"] += mine.sales
+                a["pellets"] += mine.pellets
+                a["others"] += mine.others
+                a["total"] += mine.rakes
+                a["cod"] += mine.cod
+
+        rows = []
+        for code in sorted(agg, key=_mine_sort):
+            a = agg[code]
+            rows.append({
+                "Mine": MINE_NAMES.get(code, code),
+                "Excl. Sales & Pellets": round(a["direct"], 2),
+                "Sales": round(a["sales"], 2),
+                "Pellets": round(a["pellets"], 2),
+                OTHERS_COL: round(a["others"], 2) or None,
+                "Total": round(a["total"], 2),
+                "COD Plan": round(a["cod"], 2),
+                "Achievement %": (round(a["total"] / a["cod"] * 100, 1)
+                                  if a["cod"] else None),
+            })
+        if rows:
+            keys = ["Excl. Sales & Pellets", "Sales", "Pellets", "Total",
+                    "COD Plan"]
+            total = {"Mine": "TOTAL"}
+            for k in keys:
+                total[k] = round(sum(x[k] for x in rows), 2)
+            total[OTHERS_COL] = round(sum(x[OTHERS_COL] or 0.0
+                                          for x in rows), 2) or None
+            total["Achievement %"] = (round(total["Total"] / total["COD Plan"]
+                                            * 100, 1)
+                                      if total["COD Plan"] else None)
+            rows.append(total)
+        return rows, ["Mine", "Excl. Sales & Pellets", "Sales", "Pellets",
+                      OTHERS_COL, "Total", "COD Plan", "Achievement %"]
+
+    def mine_pellet_account_rows(self) -> tuple[list[dict], list[str]]:
+        """Which plant a/c each mine's pellet conversion was booked to."""
+        agg: dict[str, dict[str, float]] = {}
+        for r in self.records:
+            for code, mine in r.mines.items():
+                if not mine.pellet_accounts:
+                    continue
+                a = agg.setdefault(code, defaultdict(float))
+                for plant, qty in mine.pellet_accounts.items():
+                    a[plant] += qty
+
+        cols = [c for c in CORE_PLANTS
+                if any(c in a for a in agg.values())]
+        # A 'Pellets : 2F OTH' line names no plant a/c. Give it a column of
+        # its own so the plant columns always add up to Pellet Rakes.
+        if any(c not in CORE_PLANTS for a in agg.values() for c in a):
+            cols.append(UNNAMED_AC)
+        rows = []
+        for code in sorted(agg, key=_mine_sort):
+            a = agg[code]
+            row = {"Mine": MINE_NAMES.get(code, code)}
+            unnamed = round(sum(q for p, q in a.items()
+                                if p not in CORE_PLANTS), 2)
+            for c in cols:
+                row[c] = ((unnamed if c == UNNAMED_AC
+                           else round(a.get(c, 0.0), 2)) or None)
+            row["Pellet Rakes"] = round(sum(a.values()), 2)
+            rows.append(row)
+        if rows:
+            total = {"Mine": "TOTAL"}
+            for c in cols + ["Pellet Rakes"]:
+                total[c] = round(sum(x.get(c) or 0.0 for x in rows), 2) or None
+            rows.append(total)
+        return rows, ["Mine"] + cols + ["Pellet Rakes"]
+
+    def daily_mine_rows(self, split: bool = True
+                        ) -> tuple[list[dict], list[str]]:
+        """One row per day, one column per mine, in EGOM reporting order.
+
+        Bolani, Barsuan and Kalta are always broken out the way EGOM reports
+        them - excluding sales and pellets, then sales, then pellets, then the
+        mine's total - as is any other mine that shows conversion in the
+        period. Pass split=False for a plain one-column-per-mine grid.
+        """
+        codes = self._mine_codes()
+        broken = set()
+        if split:
+            broken = {c for c in codes if c in SPLIT_MINES}
+            broken |= {c for c in codes
+                       if any((m := r.mines.get(c)) and m.conversion
+                              for r in self.records)}
+
+        cols: list[str] = []
+        for code in codes:
+            name = MINE_NAMES.get(code, code)
+            if code in broken:
+                cols += [f"{name} (excl. S&P)", f"{name} Sales",
+                         f"{name} Pellets", f"{name} Total"]
+            else:
+                cols.append(name)
+
+        rows = []
+        for r in self.records:
+            row = {"Date": r.label, "Day": r.day_name}
+            for code in codes:
+                name = MINE_NAMES.get(code, code)
+                mine = r.mines.get(code)
+                if code in broken:
+                    row[f"{name} (excl. S&P)"] = mine.direct if mine else 0
+                    row[f"{name} Sales"] = mine.sales if mine else 0
+                    row[f"{name} Pellets"] = mine.pellets if mine else 0
+                    row[f"{name} Total"] = mine.rakes if mine else 0
+                else:
+                    row[name] = mine.rakes if mine else 0
+            row["Sales"] = r.sales_rakes or None
+            row["Pellets"] = r.pellet_rakes or None
+            row["Total Rakes"] = r.total
+            row["COD Plan"] = r.plan
+            rows.append(row)
+        order = (["Date", "Day"] + cols
+                 + ["Sales", "Pellets", "Total Rakes", "COD Plan"])
+        return rows, order
+
+    def _mine_codes(self) -> list[str]:
+        codes = [c for c in MINE_ORDER
+                 if any(c in r.mines for r in self.records)]
+        codes += sorted({c for r in self.records for c in r.mines
+                         if c not in MINE_ORDER})
+        return codes
+
+    def daily_cod_rows(self) -> tuple[list[dict], list[str]]:
+        """Daily COD plan, mine wise: one row per day, one column per mine.
+
+        The last column is the day's stated Total COD plan, and a final
+        'Mine Total' column adds the mine-wise plans so the two can be
+        compared - they should agree when every mine line carries a plan.
+        """
+        codes = self._mine_codes()
+        names = [MINE_NAMES.get(c, c) for c in codes]
+        rows = []
+        for r in self.records:
+            row = {"Date": r.label, "Day": r.day_name}
+            for code in codes:
+                mine = r.mines.get(code)
+                row[MINE_NAMES.get(code, code)] = (round(mine.cod, 2)
+                                                   if mine else 0.0)
+            row["Mine Total"] = round(sum(row[n] for n in names), 2)
+            row["Stated COD Plan"] = round(r.plan, 2)
+            rows.append(row)
+        if rows:
+            total = {"Date": "TOTAL", "Day": ""}
+            for key in names + ["Mine Total", "Stated COD Plan"]:
+                total[key] = round(sum(x[key] for x in rows), 2)
+            rows.append(total)
+        return rows, ["Date", "Day"] + names + ["Mine Total", "Stated COD Plan"]
+
+    def daily_cod_vs_actual_rows(self) -> tuple[list[dict], list[str]]:
+        """Per day and per mine: plan, actual and variance side by side."""
+        rows = []
+        for r in self.records:
+            for code in self._mine_codes():
+                mine = r.mines.get(code)
+                if mine is None:
+                    continue
+                cod = round(mine.cod, 2)
+                rows.append({
+                    "Date": r.label,
+                    "Day": r.day_name,
+                    "Mine": MINE_NAMES.get(code, code),
+                    "COD Plan": cod,
+                    "Despatch": mine.rakes,
+                    "Variance": round(mine.rakes - cod, 2),
+                    "Achievement %": (round(mine.rakes / cod * 100, 1)
+                                      if cod else None),
+                })
+        return rows, ["Date", "Day", "Mine", "COD Plan", "Despatch",
+                      "Variance", "Achievement %"]
+
+    def group_rows(self) -> list[dict]:
+        agg: dict[str, dict] = {}
+        for r in self.records:
+            for name, g in r.groups.items():
+                a = agg.setdefault(name, {"rakes": 0.0, "lump": 0.0, "fines": 0.0})
+                a["rakes"] += g["rakes"]
+                a["lump"] += g["lump"]
+                a["fines"] += g["fines"]
+        return [{"Group": k, "Despatch": round(v["rakes"], 2),
+                 "Lump": round(v["lump"], 2), "Fines": round(v["fines"], 2),
+                 "% Share": (round(v["rakes"] / self.total * 100, 1)
+                             if self.total else 0.0)}
+                for k, v in sorted(agg.items())]
+
+    def rake_type_rows(self) -> list[tuple[str, int]]:
+        agg: dict[str, int] = defaultdict(int)
+        for r in self.records:
+            for name, n in r.rake_types.items():
+                if n:                      # drop reported nils, e.g. (0)
+                    agg[name] += n
+        return sorted(agg.items(), key=lambda kv: _rake_sort(kv[0]))
+
+    def rake_type_matrix(self) -> tuple[list[dict], list[str]]:
+        """Rake type against receiving plant - the relation table.
+
+        OTH is "others", i.e. pellets and sales conversion, so it is reported
+        under its own column rather than as a plant.
+        """
+        counts: dict[str, float] = defaultdict(float)
+        dest: dict[str, dict[str, float]] = {}
+        for r in self.records:
+            for name, n in r.rake_types.items():
+                if n:                      # a reported nil, e.g. SAIL GPWIS(0)
+                    counts[name] += n
+            for name, split in r.rake_type_dest.items():
+                d = dest.setdefault(name, defaultdict(float))
+                for code, qty in split.items():
+                    d[code] += qty
+
+        cols = [c for c in CORE_PLANTS
+                if any(c in d for d in dest.values())]
+        show_oth = any("OTH" in d for d in dest.values())
+
+        rows: list[dict] = []
+        for name in sorted(counts, key=_rake_sort):
+            d = dest.get(name, {})
+            row = {"Rake Type": name}
+            for c in cols:
+                row[c] = round(d.get(c, 0.0), 2) or None
+            if show_oth:
+                row[OTHERS_COL] = round(d.get("OTH", 0.0), 2) or None
+            allocated = round(sum(d.values()), 2)
+            row["Unsplit"] = round(counts[name] - allocated, 2) or None
+            row["Rakes"] = round(counts[name], 2)
+            rows.append(row)
+
+        order = ["Rake Type"] + cols
+        if show_oth:
+            order.append(OTHERS_COL)
+        order += ["Unsplit", "Rakes"]
+        return rows, order
+
+    def remark_rows(self) -> list[tuple[str, str]]:
+        return [(r.label, text) for r in self.records for text in r.remarks]
+
+    # ---- period aggregation ----------------------------------------------
+    def _buckets(self, keyfunc):
+        out: dict = {}
+        for r in self.records:
+            out.setdefault(keyfunc(r), []).append(r)
+        return out
+
+    def monthly_rows(self) -> list[dict]:
+        rows = []
+        for key, recs in self._buckets(lambda r: (r.day.year, r.day.month)).items():
+            d0 = recs[0].day
+            cal = month_days(d0)
+            desp = sum(r.total for r in recs)
+            plan = sum(r.plan for r in recs)
+            rows.append({
+                "Month": month_label(d0),
+                "F.Y.": fy_label(d0),
+                "Quarter": f"Q{fy_quarter(d0)}",
+                "Days Reported": len(recs),
+                "Calendar Days": cal,
+                "Despatch": round(desp, 2),
+                "COD Plan": round(plan, 2),
+                "Variance": round(desp - plan, 2),
+                "Achievement %": round(desp / plan * 100, 1) if plan else None,
+                "Rakes/Day (calendar)": round(desp / cal, 2) if cal else None,
+                "Rakes/Day (reported)": round(desp / len(recs), 2) if recs else None,
+                "_sort": (fy_start_year(d0), fiscal_month_index(d0)),
+            })
+        return [self._drop_sort(r) for r in sorted(rows, key=lambda r: r["_sort"])]
+
+    def quarter_rows(self) -> list[dict]:
+        rows = []
+        buckets = self._buckets(lambda r: (fy_start_year(r.day), fy_quarter(r.day)))
+        for (fy_y, q), recs in buckets.items():
+            months = {(r.day.year, r.day.month) for r in recs}
+            cal = sum(calendar.monthrange(y, m)[1] for y, m in months)
+            desp = sum(r.total for r in recs)
+            plan = sum(r.plan for r in recs)
+            rows.append({
+                "Quarter": f"Q{q}",
+                "F.Y.": f"F.Y.{fy_y}-{fy_y + 1}",
+                "Months": len(months),
+                "Days Reported": len(recs),
+                "Calendar Days": cal,
+                "Despatch": round(desp, 2),
+                "COD Plan": round(plan, 2),
+                "Variance": round(desp - plan, 2),
+                "Achievement %": round(desp / plan * 100, 1) if plan else None,
+                "Rakes/Day (calendar)": round(desp / cal, 2) if cal else None,
+                "_sort": (fy_y, q),
+            })
+        return [self._drop_sort(r) for r in sorted(rows, key=lambda r: r["_sort"])]
+
+    def fy_rows(self) -> list[dict]:
+        rows = []
+        for fy_y, recs in self._buckets(lambda r: fy_start_year(r.day)).items():
+            months = {(r.day.year, r.day.month) for r in recs}
+            cal = sum(calendar.monthrange(y, m)[1] for y, m in months)
+            desp = sum(r.total for r in recs)
+            plan = sum(r.plan for r in recs)
+            rows.append({
+                "F.Y.": f"F.Y.{fy_y}-{fy_y + 1}",
+                "Months Covered": len(months),
+                "Days Reported": len(recs),
+                "Calendar Days": cal,
+                "Despatch": round(desp, 2),
+                "COD Plan": round(plan, 2),
+                "Variance": round(desp - plan, 2),
+                "Achievement %": round(desp / plan * 100, 1) if plan else None,
+                "Rakes/Day (calendar)": round(desp / cal, 2) if cal else None,
+                "_sort": (fy_y,),
+            })
+        return [self._drop_sort(r) for r in sorted(rows, key=lambda r: r["_sort"])]
+
+    def weekly_rows(self) -> list[dict]:
+        rows = []
+        for key, recs in self._buckets(lambda r: r.week_key).items():
+            d0 = recs[0].day
+            start, end = week_bounds(d0)
+            span = (end - start).days + 1
+            desp = sum(r.total for r in recs)
+            plan = sum(r.plan for r in recs)
+            rows.append({
+                "Week": week_label(d0),
+                "Month": month_label(d0),
+                "F.Y.": fy_label(d0),
+                "From": start.isoformat(),
+                "To": end.isoformat(),
+                "Week Days": span,
+                "Days Reported": len(recs),
+                "Despatch": round(desp, 2),
+                "COD Plan": round(plan, 2),
+                "Variance": round(desp - plan, 2),
+                "Achievement %": round(desp / plan * 100, 1) if plan else None,
+                "Avg/Day (week days)": round(desp / span, 2) if span else None,
+                "Avg/Day (reported)": round(desp / len(recs), 2) if recs else None,
+                "_sort": key,
+            })
+        return [self._drop_sort(r) for r in sorted(rows, key=lambda r: r["_sort"])]
+
+    @staticmethod
+    def _drop_sort(row: dict) -> dict:
+        row.pop("_sort", None)
+        return row
+
+    # ---- data quality -----------------------------------------------------
+    def notes(self) -> list[tuple[str, str]]:
+        return [(r.label, n) for r in self.records for n in r.notes()]
+
+    def issues(self) -> list[tuple[str, str]]:
+        out = [(r.label, issue) for r in self.records for issue in r.checks()]
+        # Cross-check the stated cumulative against our own running total.
+        # Only meaningful within a single month, since the message resets it.
+        running = 0.0
+        prev_key = None
+        for r in self.records:
+            if r.month_key != prev_key:
+                running, prev_key = 0.0, r.month_key
+            running += r.total
+            if r.cumulative and abs(r.cumulative - running) > 0.01:
+                out.append((r.label, f"stated cumulative {r.cumulative:g} != "
+                                     f"running total {running:g}"))
+        return out
+
+    def unparsed_rows(self) -> list[tuple[str, str]]:
+        return [(r.label, line) for r in self.records for line in r.unparsed]
+
+
+def _mine_sort(code: str) -> tuple:
+    return (MINE_ORDER.index(code) if code in MINE_ORDER else 99, code)
+
+
+def _rake_sort(name: str) -> tuple:
+    return (RAKE_TYPES.index(name) if name in RAKE_TYPES else 99, name)
+
+
+def summarise(records: list[Record], month: str | None = None) -> Summary:
+    if month:
+        records = [r for r in records if r.month_key == month]
+    return Summary(records=list(records))
+
+
+# ---------------------------------------------------------------------------
+# Console output
+# ---------------------------------------------------------------------------
+
+def _n(v) -> str:
+    if v is None or v == "":
+        return "-"
+    return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.2f}"
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> str:
+    if not rows:
+        return "  (none)"
+    widths = [len(h) for h in headers]
+    for row in rows:
+        widths = [max(w, len(str(c))) for w, c in zip(widths, row)]
+    out = [" | ".join(h.ljust(w) for h, w in zip(headers, widths)),
+           "-+-".join("-" * w for w in widths)]
+    out += [" | ".join(str(c).ljust(w) for c, w in zip(row, widths)) for row in rows]
+    return "\n".join(out)
+
+
+def _dict_table(rows: list[dict], cols: list[str] | None = None) -> str:
+    if not rows:
+        return "  (none)"
+    cols = cols or list(rows[0].keys())
+    return _table(cols, [[_n(r.get(c)) if isinstance(r.get(c), (int, float))
+                          else (r.get(c) if r.get(c) is not None else "-")
+                          for c in cols] for r in rows])
+
+
+def print_report(s: Summary, title: str = "SAIL-EGOM-IRON ORE-DESPATCH-REPORT",
+                 mine_filter: str | None = None) -> None:
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    if not s.records:
+        print("\nNo records matched.\n")
+        return
+
+    pct = s.cod_pct
+    print(f"\nPeriod          : {s.records[0].label}  to  {s.records[-1].label}")
+    print(f"Financial year  : "
+          f"{', '.join(sorted({r.fy for r in s.records}))}")
+    print(f"Days reported   : {s.days}  (calendar days in range: "
+          f"{s.calendar_days})")
+    print(f"Total despatch  : {_n(s.total)} rakes")
+    print(f"Total COD plan  : {_n(s.plan)}")
+    print(f"Achievement     : {pct:.1f}%" if pct else "Achievement     : -")
+    print(f"Variance        : {_n(s.total - s.plan)}")
+    print(f"Average per day : {_n(s.total / s.days)}")
+    if s.stated_cumulative:
+        print(f"Cumulative (as stated in last message): {_n(s.stated_cumulative)}")
+
+    print("\nFINANCIAL YEAR SUMMARY (plan vs actual)")
+    print(_dict_table(s.fy_rows()))
+
+    print("\nQUARTERLY SUMMARY (plan vs actual)")
+    print(_dict_table(s.quarter_rows()))
+
+    print("\nMONTHLY SUMMARY (plan vs actual, with rakes/day)")
+    print(_dict_table(s.monthly_rows()))
+
+    print("\nWEEKLY AVERAGES (Sunday to Saturday, clipped to month)")
+    print(_dict_table(s.weekly_rows(),
+                      ["Week", "Month", "Week Days", "Days Reported",
+                       "Despatch", "COD Plan", "Achievement %",
+                       "Avg/Day (week days)"]))
+
+    print("\nGROUP WISE")
+    print(_dict_table(s.group_rows()))
+
+    print("\nMINE WISE DESPATCH vs COD")
+    print(_dict_table(s.mine_rows(mine_filter),
+                      ["Mine", "Name", "Group", "Despatch", "COD Plan",
+                       "Achievement %", "% Share"]))
+
+    rows, cols = s.mine_plant_matrix()
+    print("\nMINE TO PLANT DISTRIBUTION")
+    print(_dict_table(rows, cols))
+
+    rows, cols = s.mine_conversion_rows()
+    print("\nMINE WISE SALES AND PELLETS CONVERSION")
+    print(_dict_table(rows, cols))
+
+    print("\nPLANT WISE DISTRIBUTION")
+    print(_dict_table(s.plant_rows(),
+                      ["Plant", "Name", "Type", "Despatch", "COD Plan",
+                       "Achievement %", "Lump", "Fines"]))
+
+    pel = s.pellet_account_rows()
+    if pel:
+        print("\nPELLET CONVERSION BY PLANT A/C")
+        print(_dict_table(pel))
+
+    rows, cols = s.mine_pellet_account_rows()
+    if rows:
+        print("\nMINE WISE PELLET CONVERSION BY PLANT A/C")
+        print(_dict_table(rows, cols))
+
+    print("\nRAKE TYPES")
+    print(_table(["Type", "Rakes"], [[k, _n(v)] for k, v in s.rake_type_rows()]))
+
+    rows, cols = s.rake_type_matrix()
+    print("\nRAKE TYPE TO PLANT")
+    print(_dict_table(rows, cols))
+
+    rows, cols = s.daily_mine_rows()
+    print("\nDAILY MINE WISE DESPATCH")
+    print(_dict_table(rows, cols))
+
+    rows, cols = s.daily_cod_rows()
+    print("\nDAILY COD PLAN, MINE WISE")
+    print(_dict_table(rows, cols))
+
+    notes = s.notes()
+    if notes:
+        print(f"\nCONVERSION NOTES ({len(notes)})")
+        for label, note in notes[:25]:
+            print(f"  {label}: {note}")
+        if len(notes) > 25:
+            print(f"  ... and {len(notes) - 25} more")
+
+    issues = s.issues()
+    if issues:
+        print(f"\nDATA CHECKS ({len(issues)} to review)")
+        for label, issue in issues[:25]:
+            print(f"  {label}: {issue}")
+        if len(issues) > 25:
+            print(f"  ... and {len(issues) - 25} more")
+    else:
+        print("\nDATA CHECKS: all messages internally consistent.")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Exports
+# ---------------------------------------------------------------------------
+
+def write_csv(s: Summary, path: str) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Date", "Despatch", "COD Plan", "Variance", "Achievement %",
+                    "Cumulative", "KTR dest", "KTR rakes"])
+        for r in s.records:
+            w.writerow([r.label, r.total, r.plan, r.variance,
+                        round(r.achievement, 1) if r.achievement else "",
+                        r.cumulative, r.ktr_dest, r.ktr_rakes])
+        w.writerow([])
+        w.writerow(["Mine", "Name", "Group", "Despatch", "COD Plan",
+                    "Achievement %", "% Share"])
+        for r in s.mine_rows():
+            w.writerow([r["Mine"], r["Name"], r["Group"], r["Despatch"],
+                        r["COD Plan"], r["Achievement %"], r["% Share"]])
+    print(f"CSV written  : {path}")
+
+
+def write_excel(s: Summary, path: str) -> None:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except ImportError:
+        print("Excel export skipped - pip install openpyxl", file=sys.stderr)
+        return
+
+    wb = Workbook()
+    pct = s.cod_pct
+
+    ws = wb.active
+    ws.title = "Summary"
+    for row in [
+        ("Period from", s.records[0].label if s.records else ""),
+        ("Period to", s.records[-1].label if s.records else ""),
+        ("Financial year", ", ".join(sorted({r.fy for r in s.records}))),
+        ("Days reported", s.days),
+        ("Total despatch", s.total),
+        ("Total COD plan", round(s.plan, 2)),
+        ("Achievement %", round(pct, 1) if pct else ""),
+        ("Variance", round(s.total - s.plan, 2)),
+        ("Average per day", round(s.total / s.days, 2) if s.days else ""),
+        ("Cumulative (stated)", s.stated_cumulative),
+    ]:
+        ws.append(row)
+
+    def sheet(name: str, headers: list[str], rows: list[list]) -> None:
+        w = wb.create_sheet(name[:31])
+        w.append(headers)
+        for row in rows:
+            w.append(row)
+
+    def dict_sheet(name: str, rows: list[dict], cols: list[str] | None = None):
+        if not rows:
+            return
+        cols = cols or list(rows[0].keys())
+        sheet(name, cols, [[r.get(c) for c in cols] for r in rows])
+
+    dict_sheet("FY Summary", s.fy_rows())
+    dict_sheet("Quarterly", s.quarter_rows())
+    dict_sheet("Monthly", s.monthly_rows())
+    dict_sheet("Weekly", s.weekly_rows())
+    sheet("Daily", ["Date", "Despatch", "COD Plan", "Variance",
+                    "Achievement %", "Cumulative", "KTR dest", "KTR rakes"],
+          [[r.label, r.total, r.plan, r.variance,
+            round(r.achievement, 1) if r.achievement else None,
+            r.cumulative, r.ktr_dest, r.ktr_rakes] for r in s.records])
+    rows, cols = s.daily_mine_rows()
+    dict_sheet("Daily Mine Wise", rows, cols)
+    rows, cols = s.daily_cod_rows()
+    dict_sheet("Daily COD Mine Wise", rows, cols)
+    rows, cols = s.daily_cod_vs_actual_rows()
+    dict_sheet("Daily COD vs Actual", rows, cols)
+    dict_sheet("Mine Wise", s.mine_rows())
+    rows, cols = s.mine_plant_matrix()
+    dict_sheet("Mine to Plant", rows, cols)
+    rows, cols = s.mine_conversion_rows()
+    dict_sheet("Mine Sales & Pellets", rows, cols)
+    dict_sheet("Plant Wise", s.plant_rows())
+    dict_sheet("Pellet Accounts", s.pellet_account_rows())
+    rows, cols = s.mine_pellet_account_rows()
+    dict_sheet("Mine Pellet Accounts", rows, cols)
+    dict_sheet("Group Wise", s.group_rows())
+    sheet("Rake Types", ["Type", "Rakes"], [list(kv) for kv in s.rake_type_rows()])
+    rows, cols = s.rake_type_matrix()
+    dict_sheet("Rake Type to Plant", rows, cols)
+    sheet("Remarks", ["Date", "Remark"], [list(kv) for kv in s.remark_rows()])
+    sheet("Conversion Notes", ["Date", "Note"], [list(kv) for kv in s.notes()])
+    sheet("Data Checks", ["Date", "Issue"], [list(kv) for kv in s.issues()])
+
+    bold = Font(bold=True)
+    for sh in wb:
+        for cell in sh[1]:
+            cell.font = bold
+        for col in sh.columns:
+            width = min(60, max(len(str(c.value or "")) for c in col) + 2)
+            sh.column_dimensions[col[0].column_letter].width = width
+    wb.save(path)
+    print(f"Excel written: {path}")
+
+
+def write_charts(s: Summary, outdir: str) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Charts skipped - pip install matplotlib", file=sys.stderr)
+        return
+
+    os.makedirs(outdir, exist_ok=True)
+
+    rows = s.mine_rows()
+    if rows:
+        labels = [r["Mine"] for r in rows]
+        x = range(len(labels))
+        fig, ax = plt.subplots(figsize=(max(6, len(labels)), 4.5))
+        ax.bar([i - 0.2 for i in x], [r["COD Plan"] for r in rows], 0.4,
+               label="COD plan", color="white", edgecolor="black")
+        ax.bar([i + 0.2 for i in x], [r["Despatch"] for r in rows], 0.4,
+               label="Despatch", color="black")
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(labels)
+        ax.set_title("Mine wise despatch vs COD plan")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "mine_wise.png"), dpi=150)
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(max(6, s.days * 0.55), 4))
+    ax.plot([r.label for r in s.records], [r.total for r in s.records],
+            marker="o", color="black", label="Despatch")
+    ax.plot([r.label for r in s.records], [r.plan for r in s.records],
+            linestyle="--", color="grey", label="COD plan")
+    ax.set_title("Daily despatch vs plan")
+    ax.tick_params(axis="x", rotation=90)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "daily_trend.png"), dpi=150)
+    plt.close(fig)
+    print(f"Charts written to {outdir}")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def diagnose(text: str, records: list[Record]) -> None:
+    print("=" * 78)
+    print("PARSER DIAGNOSTICS")
+    print("=" * 78)
+    lines = [l for l in clean(text).split("\n") if l.strip()]
+    print(f"\nNon-blank lines : {len(lines)}")
+    print(f"Records found   : {len(records)}\n")
+    print(_table(["Date", "Total", "Plan", "Mines", "Dest lines", "Plants",
+                  "Rake types", "Remarks", "Unparsed"],
+                 [[r.label, _n(r.total) if r.total else "MISSING",
+                   _n(r.plan) if r.plan else "MISSING",
+                   len(r.mines) or "NONE",
+                   sum(len(m.dest) for m in r.mines.values()) or "NONE",
+                   len(r.plants) or "NONE",
+                   len(r.rake_types) or "NONE", len(r.remarks),
+                   len(r.unparsed)]
+                  for r in records]))
+    leftover = [(r.label, l) for r in records for l in r.unparsed]
+    if leftover:
+        print(f"\nLines the parser did not recognise ({len(leftover)}):")
+        for label, line in leftover[:40]:
+            print(f"  {label}: {line}")
+        if len(leftover) > 40:
+            print(f"  ... and {len(leftover) - 40} more")
+    print()
+
+
+SAMPLE = """[02/08, 8:08 am] +91 89868 80137: Despatch Performance ```1-August-2026```
+********************
+Total Rakes               *19*
+********************
+```Jharkhand Group of Mines ``` : 1.44L+6.56F: *8.00 Rakes*
+*KBR(4):*        ```(Daily COD Plan- 2.84 Rakes)```
+                        (1  L+2  F)BSL
+                        1FRSP
+*MBR(0):*       ```(Daily COD Plan: 1.74 Rakes)```
+*GUA(4):*       ```(Daily COD Plan : 4.62 Rakes)```
+                         (0.22  L+0.78  F)DSP
+                        (0.22  L+1.78  F)ISP
+1F ISP Rajaburu
+*MPR(0):*       ```(Daily COD Plan : 0.32 Rakes)```
+```Odisha Group of Mines``` : 0.00L+11.00F: *11.00 Rakes*
+*BOL(6):*        ```(Daily COD Plan : 7.19 Rakes)```
+                        Pellets :  1FBSL  1FRSP  2FISP
+Sales: 2F OTH
+*BAR(2):*        ```(Daily COD Plan : 1.94 Rakes)```
+                        1FRSP
+                        Pellets :  1FBSP
+*TAL(2):*         ```(Daily COD Plan : 1.20 Rakes)```
+                        2FRSP
+*KAL(1):*         ```(Daily COD Plan : 2.26 Rakes)```
+                        1FBSL
+```Plant Distribution```
+*BSL* : 1.00L+3.00F: *4 Rakes*        ```(Daily COD Plan : 4.61 Rakes)```
+*DSP* : 0.22L+0.78F: *1 Rakes*        ```(Daily COD Plan : 3.23 Rakes)```
+*RSP* : 0.00L+4.00F: *4 Rakes*        ```(Daily COD Plan : 4.33 Rakes)```
+*ISP* : 0.22L+2.78F: *3 Rakes*         ```(Daily COD Plan :2.91 Rakes)```
+*BSP* : 0.00L+0.00F: *0 Rakes*        ```(Daily COD Plan : 0.48 Rakes)```
+*Sales*: [2F OTH] : *2 Rakes*            ```(Daily COD Plan : 2.52 Rakes)```
+*Pellets* : [1FBSL,,1FRSP,2FISP,1FBSP] : *5 Rakes*   ```(Daily COD Plan : 4.01 Rakes)```
+*Cumulative: 19 Rakes*
+```(Daily COD Plan // Current Mth Avg : 22.09 // 19.00Rakes)```
+
+Rake Types:
+BOSM(1) 1ISP
+BOXN(1) |1DSP
+BOYN(4) 4BSL
+BOBSN(5) |3RSP|2ISP
+SAIL GPWIS(0)
+SAIL BOBSN(1) |1RSP
+Pvt. GPWIS(7) |2OTH|1PBSL|1PRSP|2PISP|1PBSP
+*KTR* : NIL (*Nil Rakes* )
+Remarks ::
+
+*1.Kalta-Less loading due to unavailability of permit.*
+*2. Kuteshwar- Loading stopped due to IR Issues.*
+Regards
+"""
+
+
+def selftest() -> int:
+    """Verify the parser against one known message."""
+    fails: list[str] = []
+
+    def check(what: str, got, want) -> None:
+        if got != want:
+            fails.append(f"{what}: got {got!r}, expected {want!r}")
+
+    # --- calendar helpers --------------------------------------------------
+    check("fy label Aug-2026", fy_label(date(2026, 8, 1)), "F.Y.2026-2027")
+    check("fy label Mar-2026", fy_label(date(2026, 3, 31)), "F.Y.2025-2026")
+    check("fy label Apr-2025", fy_label(date(2025, 4, 1)), "F.Y.2025-2026")
+    check("Q1 is April", fy_quarter(date(2025, 4, 15)), 1)
+    check("Q1 is June", fy_quarter(date(2025, 6, 30)), 1)
+    check("Q2 is July", fy_quarter(date(2025, 7, 1)), 2)
+    check("Q4 is March", fy_quarter(date(2026, 3, 1)), 4)
+    check("month label", month_label(date(2026, 8, 1)), "Aug-26")
+    # 1-Aug-2026 is a Saturday, so the month's first week is a single day.
+    check("short first week", week_bounds(date(2026, 8, 1)),
+          (date(2026, 8, 1), date(2026, 8, 1)))
+    check("first week index", week_index(date(2026, 8, 1)), 1)
+    # 2-Aug-2026 is the first Sunday: a full Sun-Sat week.
+    check("full second week", week_bounds(date(2026, 8, 2)),
+          (date(2026, 8, 2), date(2026, 8, 8)))
+    check("second week index", week_index(date(2026, 8, 2)), 2)
+    # 31-Aug-2026 is a Monday, so the last week is Sun 30 - Mon 31.
+    check("short last week", week_bounds(date(2026, 8, 31)),
+          (date(2026, 8, 30), date(2026, 8, 31)))
+
+    # --- message parsing ---------------------------------------------------
+    recs = parse_records(SAMPLE)
+    check("record count", len(recs), 1)
+    if not recs:
+        print("SELFTEST FAILED: no records parsed")
+        return 1
+    r = recs[0]
+    check("date", r.label, "1-August-2026")
+    check("total rakes", r.total, 19.0)
+    check("day COD plan", r.plan, 22.09)
+    check("month avg", r.mth_avg, 19.0)
+    check("cumulative", r.cumulative, 19.0)
+    check("mine count", len(r.mines), 8)
+    check("KBR rakes", r.mines["KBR"].rakes, 4)
+    check("KBR cod", r.mines["KBR"].cod, 2.84)
+    check("BOL rakes", r.mines["BOL"].rakes, 6)
+    check("mine sum", sum(m.rakes for m in r.mines.values()), 19)
+    check("rake types exclude mines", "BOXN" in r.mines, False)
+
+    # mine -> plant destinations
+    check("KBR dest BSL", r.mines["KBR"].dest.get("BSL"), 3.0)
+    check("KBR dest RSP", r.mines["KBR"].dest.get("RSP"), 1.0)
+    check("KBR fully allocated", r.mines["KBR"].unallocated, 0.0)
+    check("GUA dest DSP", r.mines["GUA"].dest.get("DSP"), 1.0)
+    # (0.22L+1.78F)ISP plus the separate "1F ISP Rajaburu" line.
+    check("GUA dest ISP", r.mines["GUA"].dest.get("ISP"), 3.0)
+    check("GUA fully allocated", r.mines["GUA"].unallocated, 0.0)
+
+    # A mine's own Sales / Pellets lines are conversion, not direct despatch.
+    bol = r.mines["BOL"]
+    check("BOL no direct plant", bol.dest, {})
+    check("BOL direct", bol.direct, 0.0)
+    check("BOL pellets", bol.pellets, 4.0)
+    check("BOL sales", bol.sales, 2.0)
+    check("BOL pellet a/c", bol.pellet_accounts,
+          {"BSL": 1.0, "RSP": 1.0, "ISP": 2.0})
+    check("BOL sales a/c", bol.sales_accounts, {"OTH": 2.0})
+    check("BOL conversion", bol.conversion, 6.0)
+    check("BOL fully allocated", bol.unallocated, 0.0)
+    bar = r.mines["BAR"]
+    check("BAR direct RSP", bar.dest.get("RSP"), 1.0)
+    check("BAR pellets", bar.pellets, 1.0)
+    check("BAR pellet a/c", bar.pellet_accounts, {"BSP": 1.0})
+    check("BAR four way split",
+          (bar.direct, bar.sales, bar.pellets, bar.rakes), (1.0, 0.0, 1.0, 2))
+    check("TAL direct RSP", r.mines["TAL"].dest.get("RSP"), 2.0)
+    check("KAL direct BSL", r.mines["KAL"].dest.get("BSL"), 1.0)
+    # The mine lines and the plant distribution must reconcile both ways.
+    check("mine pellets tie to plant distribution",
+          round(sum(m.pellets for m in r.mines.values()), 2), 5.0)
+    check("mine sales tie to plant distribution",
+          round(sum(m.sales for m in r.mines.values()), 2), 2.0)
+    check("mine direct BSL ties",
+          round(sum(m.dest.get("BSL", 0.0) for m in r.mines.values()), 2), 4.0)
+    check("mine direct RSP ties",
+          round(sum(m.dest.get("RSP", 0.0) for m in r.mines.values()), 2), 4.0)
+    check("mine direct ISP ties",
+          round(sum(m.dest.get("ISP", 0.0) for m in r.mines.values()), 2), 3.0)
+    check("no mine reports untagged others",
+          [c for c, m in r.mines.items() if m.others], [])
+
+    # plant distribution
+    check("plant count", len(r.plants), 7)
+    check("BSL rakes", r.plants["BSL"].rakes, 4.0)
+    check("BSL lump", r.plants["BSL"].lump, 1.0)
+    check("Sales rakes", r.plants["Sales"].rakes, 2.0)
+    check("Pellets rakes", r.plants["Pellets"].rakes, 5.0)
+    check("core plant total", r.core_plant_total, 12.0)
+    check("conversion total", r.conversion_total, 7.0)
+    check("pellet accounts", r.pellet_accounts,
+          {"BSL": 1.0, "RSP": 1.0, "ISP": 2.0, "BSP": 1.0})
+    check("sales accounts", r.sales_accounts, {"OTH": 2.0})
+
+    # Rake types fold onto the EGOM vocabulary, and each line's plant split
+    # must tie to its bracketed count.
+    check("BOBSN folds to BOBSNM", r.rake_types.get("BOBSNM"), 5)
+    check("BOXN folds to BOXN/BOXNHL", r.rake_types.get("BOXN/BOXNHL"), 1)
+    check("BOYN folds to BOYN/BOYEL", r.rake_types.get("BOYN/BOYEL"), 4)
+    check("BOSM stays BOSM", r.rake_types.get("BOSM"), 1)
+    check("Pvt GPWIS rake type", r.rake_types.get("Pvt. GPWIS BOXN/BOXNHL"), 7)
+    check("SAIL BOBSN folds", r.rake_types.get("SAIL GPWIS BOBSNM"), 1)
+    check("canonical BOXNHL", canonical_rake_type("BOXNHL"), "BOXN/BOXNHL")
+    check("canonical SAIL GPWIS BOST",
+          canonical_rake_type("SAIL GPWIS BOST"), "SAIL GPWIS BOSTHSM")
+    check("canonical unknown kept", canonical_rake_type("WIDGET"), "WIDGET")
+    # "Pvt. GPWIS(7) |2OTH|1PBSL|1PRSP|2PISP|1PBSP" -> P is a private-wagon
+    # marker, OTH is pellets + sales, and the split totals the bracketed 7.
+    pvt = r.rake_type_dest["Pvt. GPWIS BOXN/BOXNHL"]
+    check("pvt split BSL", pvt.get("BSL"), 1.0)
+    check("pvt split RSP", pvt.get("RSP"), 1.0)
+    check("pvt split ISP", pvt.get("ISP"), 2.0)
+    check("pvt split BSP", pvt.get("BSP"), 1.0)
+    check("pvt split OTH", pvt.get("OTH"), 2.0)
+    check("pvt split ties to count", sum(pvt.values()), 7.0)
+    check("BOBSNM split",
+          r.rake_type_dest["BOBSNM"], {"RSP": 3.0, "ISP": 2.0})
+    check("KTR dest", r.ktr_dest.upper(), "NIL")
+    check("KTR rakes", r.ktr_rakes, 0.0)
+    check("remark count", len(r.remarks), 2)
+    check("group count", len(r.groups), 2)
+    check("Jharkhand rakes", r.groups["Jharkhand"]["rakes"], 8.0)
+
+    # The core plants alone (12) fall short of Total Rakes (19); the 7 rake
+    # difference is sales + pellets conversion, which must NOT be an error.
+    check("no false plant mismatch",
+          [i for i in r.checks() if "plant distribution" in i], [])
+    check("conversion explained",
+          any("routed as conversion" in n for n in r.notes()), True)
+    check("internal checks clean", r.checks(), [])
+
+    # --- period aggregation ------------------------------------------------
+    s = summarise(recs)
+    check("monthly rows", len(s.monthly_rows()), 1)
+    mrow = s.monthly_rows()[0]
+    check("monthly label", mrow["Month"], "Aug-26")
+    check("monthly fy", mrow["F.Y."], "F.Y.2026-2027")
+    check("monthly quarter", mrow["Quarter"], "Q2")
+    check("monthly calendar days", mrow["Calendar Days"], 31)
+    check("monthly rakes/day", mrow["Rakes/Day (calendar)"], round(19 / 31, 2))
+    check("quarter rows", len(s.quarter_rows()), 1)
+    check("fy rows", len(s.fy_rows()), 1)
+    check("weekly rows", len(s.weekly_rows()), 1)
+    wrow = s.weekly_rows()[0]
+    check("weekly week days", wrow["Week Days"], 1)
+    check("weekly avg", wrow["Avg/Day (week days)"], 19.0)
+
+    rows, cols = s.mine_plant_matrix()
+    check("matrix has total row", rows[-1]["Mine"], "TOTAL")
+    check("matrix total sales", rows[-1]["Sales"], 2.0)
+    check("matrix total pellets", rows[-1]["Pellets"], 5.0)
+    check("matrix mine order", [x["Mine"] for x in rows[:4]],
+          ["Manoharpur", "Gua", "Kiriburu", "Meghataburu"])
+    check("matrix cols start", cols[:3], ["Mine", "BSL", "DSP"])
+    check("matrix has others col", OTHERS_COL in cols, True)
+    check("matrix ends", cols[-2:], ["Unallocated", "Total"])
+
+    conv_rows, conv_cols = s.mine_conversion_rows()
+    check("conversion cols", conv_cols[:4],
+          ["Mine", "Excl. Sales & Pellets", "Sales", "Pellets"])
+    bol_row = next(x for x in conv_rows if x["Mine"] == "Bolani")
+    check("conversion Bolani four way",
+          (bol_row["Excl. Sales & Pellets"], bol_row["Sales"],
+           bol_row["Pellets"], bol_row["Total"]),
+          (0.0, 2.0, 4.0, 6.0))
+    check("conversion total row",
+          (conv_rows[-1]["Mine"], conv_rows[-1]["Excl. Sales & Pellets"],
+           conv_rows[-1]["Sales"], conv_rows[-1]["Pellets"],
+           conv_rows[-1]["Total"]),
+          ("TOTAL", 12.0, 2.0, 5.0, 19.0))
+
+    pa_rows, pa_cols = s.mine_pellet_account_rows()
+    check("pellet a/c cols", pa_cols, ["Mine", "BSL", "RSP", "ISP", "BSP",
+                                       "Pellet Rakes"])
+    check("pellet a/c Bolani",
+          {k: v for k, v in
+           next(x for x in pa_rows if x["Mine"] == "Bolani").items()
+           if v is not None},
+          {"Mine": "Bolani", "BSL": 1.0, "RSP": 1.0, "ISP": 2.0,
+           "Pellet Rakes": 4.0})
+    check("pellet a/c total", pa_rows[-1]["Pellet Rakes"], 5.0)
+
+    rows, cols = s.daily_mine_rows()
+    check("daily mine row count", len(rows), 1)
+    check("daily mine day column", cols[1], "Day")
+    check("daily mine first mine col", cols[2], "Manoharpur")
+    # Bolani, Barsuan and Kalta are always shown the EGOM way: excluding
+    # sales and pellets, then sales, then pellets, then the mine total.
+    check("daily mine Bolani split",
+          (rows[0]["Bolani (excl. S&P)"], rows[0]["Bolani Sales"],
+           rows[0]["Bolani Pellets"], rows[0]["Bolani Total"]),
+          (0.0, 2.0, 4.0, 6))
+    check("daily mine Barsuan split",
+          (rows[0]["Barsuan (excl. S&P)"], rows[0]["Barsuan Sales"],
+           rows[0]["Barsuan Pellets"], rows[0]["Barsuan Total"]),
+          (1.0, 0.0, 1.0, 2))
+    check("daily mine Kalta split",
+          (rows[0]["Kalta (excl. S&P)"], rows[0]["Kalta Sales"],
+           rows[0]["Kalta Pellets"], rows[0]["Kalta Total"]),
+          (1.0, 0.0, 0.0, 1))
+    # A mine with no conversion keeps a single column.
+    check("daily mine Gua single col", rows[0]["Gua"], 4)
+    check("daily mine unsplit grid",
+          "Bolani" in s.daily_mine_rows(split=False)[1], True)
+    check("daily mine total", rows[0]["Total Rakes"], 19.0)
+    # 1-Aug-2026 is a Saturday.
+    check("day name", rows[0]["Day"], "Sat")
+    check("record day name", r.day_name, "Sat")
+
+    cod_rows, cod_cols = s.daily_cod_rows()
+    check("daily cod cols", cod_cols[:2], ["Date", "Day"])
+    check("daily cod ends", cod_cols[-2:], ["Mine Total", "Stated COD Plan"])
+    check("daily cod has total row", cod_rows[-1]["Date"], "TOTAL")
+    check("daily cod stated plan", cod_rows[0]["Stated COD Plan"],
+          round(r.plan, 2))
+    check("daily cod mine total ties",
+          cod_rows[0]["Mine Total"],
+          round(sum(m.cod for m in r.mines.values()), 2))
+
+    va_rows, va_cols = s.daily_cod_vs_actual_rows()
+    check("cod vs actual cols", va_cols[2], "Mine")
+    check("cod vs actual rows", len(va_rows), len(r.mines))
+    check("cod vs actual variance",
+          va_rows[0]["Variance"],
+          round(va_rows[0]["Despatch"] - va_rows[0]["COD Plan"], 2))
+
+    rows, cols = s.rake_type_matrix()
+    check("rake matrix cols", cols[0], "Rake Type")
+    check("rake matrix has others", "Others (pellets + sales)" in cols, True)
+    check("rake matrix ends with rakes", cols[-1], "Rakes")
+    pvt_row = next(x for x in rows if x["Rake Type"].startswith("Pvt."))
+    check("rake matrix pvt total", pvt_row["Rakes"], 7.0)
+    check("rake matrix pvt others", pvt_row["Others (pellets + sales)"], 2.0)
+    check("rake matrix pvt fully split", pvt_row["Unsplit"], None)
+    check("rake matrix order puts pvt first", rows[0]["Rake Type"],
+          "Pvt. GPWIS BOXN/BOXNHL")
+
+    if fails:
+        print(f"SELFTEST: {len(fails)} failure(s)")
+        for f in fails:
+            print(f"  - {f}")
+        return 1
+    print("SELFTEST PASSED - parser matches the known message format.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def pick_file() -> str | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    path = filedialog.askopenfilename(
+        title="Select the despatch messages file",
+        filetypes=[("Word / text", "*.docx *.txt *.md"), ("All files", "*.*")])
+    root.destroy()
+    return path or None
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Despatch performance report.")
+    ap.add_argument("source", nargs="?",
+                    help="path to .docx / .txt, or '-' for stdin "
+                         "(a file picker opens if omitted)")
+    ap.add_argument("--month", help="filter to one month, YYYY-MM")
+    ap.add_argument("--fy", type=int, metavar="YEAR",
+                    help="filter to a financial year by its start year, "
+                         "e.g. 2025 for F.Y.2025-2026")
+    ap.add_argument("--mine", help="filter mine table to codes containing this")
+    ap.add_argument("--csv", metavar="PATH")
+    ap.add_argument("--excel", metavar="PATH")
+    ap.add_argument("--charts", metavar="DIR")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="show what each pattern matched per day")
+    ap.add_argument("--dump-text", metavar="PATH",
+                    help="write the text extracted from the .docx")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check the parser against a known message")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+
+    if not args.source:
+        args.source = pick_file()
+        if not args.source:
+            ap.print_usage()
+            print("\nNo file chosen.", file=sys.stderr)
+            return 1
+        print(f"Reading: {args.source}\n")
+
+    try:
+        text = extract_text(args.source)
+    except FileNotFoundError:
+        print(f"File not found: {args.source}", file=sys.stderr)
+        return 1
+    except (zipfile.BadZipFile, KeyError):
+        print(f"Not a readable .docx: {args.source}", file=sys.stderr)
+        return 1
+
+    if args.dump_text:
+        with open(args.dump_text, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"Extracted text written: {args.dump_text}")
+
+    records = parse_records(text)
+    if args.diagnose:
+        diagnose(text, records)
+    if not records:
+        print("No dated records found (expected e.g. 1-August-2026).",
+              file=sys.stderr)
+        return 1
+
+    months = sorted({r.month_key for r in records})
+    if args.month and args.month not in months:
+        print(f"No data for {args.month}. Available: {', '.join(months)}",
+              file=sys.stderr)
+        return 1
+
+    if args.fy:
+        records = [r for r in records if fy_start_year(r.day) == args.fy]
+        if not records:
+            print(f"No data for F.Y.{args.fy}-{args.fy + 1}.", file=sys.stderr)
+            return 1
+
+    s = summarise(records, month=args.month)
+    if args.mine:
+        print(f"(mine filter: {args.mine})")
+    suffix = ""
+    if args.month:
+        suffix = f" - {args.month}"
+    elif args.fy:
+        suffix = f" - F.Y.{args.fy}-{args.fy + 1}"
+    print_report(s, title="SAIL-EGOM-IRON ORE-DESPATCH-REPORT" + suffix,
+                 mine_filter=args.mine)
+    if len(months) > 1 and not args.month:
+        print(f"Months in file: {', '.join(months)} "
+              f"(use --month YYYY-MM for one)\n")
+
+    if args.csv:
+        write_csv(s, args.csv)
+    if args.excel:
+        write_excel(s, args.excel)
+    if args.charts:
+        write_charts(s, args.charts)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
