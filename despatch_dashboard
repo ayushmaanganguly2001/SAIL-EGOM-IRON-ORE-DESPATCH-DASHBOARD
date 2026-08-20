@@ -69,6 +69,7 @@ try:
         CORE_PLANTS,
         MINE_NAMES,
         MINE_ORDER,
+        OTHERS_COL,
         SPLIT_MINES,
         Summary,
         clean,
@@ -141,46 +142,100 @@ _PALETTE = {
 
 _CSS = """
 <style>
+  /* KPI cards are rendered by hand rather than with st.metric, whose internal
+     markup changes between Streamlit versions and used to swallow the label.
+     Colours come from the live theme variables, so the text stays legible
+     whether the reader is in light or dark mode - including a theme switched
+     from the browser, which Python cannot see. */
+  .kpi {
+      background: var(--secondary-background-color, #f0f2f6);
+      border: 1px solid rgba(130,140,155,.30);
+      border-left: 4px solid __ACCENT__;
+      border-radius: 10px;
+      padding: 12px 14px 11px 14px;
+      height: 100%;
+  }
+  .kpi-label {
+      font-size: .70rem; letter-spacing: .07em; text-transform: uppercase;
+      font-weight: 700; margin-bottom: 5px;
+      color: var(--text-color, #12212f); opacity: .70;
+  }
+  .kpi-value {
+      font-size: 1.55rem; font-weight: 700; line-height: 1.15;
+      color: var(--text-color, #12212f);
+  }
+  .kpi-unit {
+      font-size: .82rem; font-weight: 600; margin-left: 4px; opacity: .60;
+      color: var(--text-color, #12212f);
+  }
+  .kpi-sub { font-size: .76rem; font-weight: 600; margin-top: 6px; }
+  .k-good { color: #17a34a; }
+  .k-warn { color: #c07f00; }
+  .k-bad  { color: #e0455a; }
+  .k-flat { color: var(--text-color, #12212f); opacity: .62; }
+
+  .blk {
+      font-size: .80rem; font-weight: 700; letter-spacing: .09em;
+      text-transform: uppercase; margin: 14px 0 8px 0;
+      color: var(--text-color, #12212f); opacity: .78;
+      border-bottom: 1px solid rgba(130,140,155,.30); padding-bottom: 4px;
+  }
+
   div[data-testid="stMetric"] {
-      background: __CARD_BG__;
-      border: 1px solid __CARD_BORDER__;
+      background: var(--secondary-background-color, #f0f2f6);
+      border: 1px solid rgba(130,140,155,.30);
       border-left: 4px solid __ACCENT__;
       border-radius: 10px;
       padding: 14px 16px 10px 16px;
   }
-  div[data-testid="stMetricLabel"] p {
+  div[data-testid="stMetricLabel"], div[data-testid="stMetricLabel"] * {
       font-size: 0.78rem; letter-spacing: .04em;
-      text-transform: uppercase; color: __LABEL__ !important;
+      text-transform: uppercase;
+      color: var(--text-color, #12212f) !important; opacity: .72;
   }
-  div[data-testid="stMetricValue"] {
-      font-size: 1.7rem; color: __VALUE__ !important;
+  div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] * {
+      font-size: 1.7rem; color: var(--text-color, #12212f) !important;
   }
-  div[data-testid="stMetricValue"] div { color: __VALUE__ !important; }
   .badge {
       display:inline-block; padding:3px 12px; border-radius:999px;
       font-size:0.82rem; font-weight:600; margin-right:8px; margin-bottom:6px;
   }
-  .b-good { background:__GOOD_BG__; color:__GOOD_FG__; }
-  .b-warn { background:__WARN_BG__; color:__WARN_FG__; }
-  .b-bad  { background:__BAD_BG__;  color:__BAD_FG__; }
-  .b-flat { background:__FLAT_BG__; color:__FLAT_FG__; }
+  /* Translucent fills, so a badge reads on a light or a dark page alike. */
+  .b-good { background:rgba(23,163,74,.16);  color:#17a34a; }
+  .b-warn { background:rgba(192,127,0,.18);  color:#c07f00; }
+  .b-bad  { background:rgba(224,69,90,.16);  color:#e0455a; }
+  .b-flat {
+      background:rgba(130,140,155,.20);
+      color: var(--text-color, __FLAT_FG__); opacity:.92;
+  }
   h3 { padding-top: .3rem; }
 
   .egom-title {
       font-size: 1.75rem; font-weight: 700; letter-spacing: .06em;
-      color: __TITLE__; margin-bottom: 0;
+      color: var(--primary-color, __TITLE__); margin-bottom: 0;
   }
-  .egom-sub { color:__SUB__; font-size:0.9rem; margin-top:2px; }
+  .egom-sub {
+      color: var(--text-color, __SUB__); opacity:.72;
+      font-size:0.9rem; margin-top:2px;
+  }
 
   .rmk-card {
-      background:__RMK_BG__; border:1px solid __CARD_BORDER__;
+      background: var(--secondary-background-color, __RMK_BG__);
+      border:1px solid rgba(130,140,155,.30);
       border-left:4px solid __ACCENT__;
       border-radius:8px; padding:10px 14px; margin-bottom:10px;
   }
-  .rmk-date { font-weight:700; color:__RMK_DATE__; font-size:0.95rem; }
-  .rmk-item { margin:5px 0 0 0; color:__RMK_FG__; font-size:0.92rem; }
+  .rmk-date {
+      font-weight:700; font-size:0.95rem;
+      color: var(--primary-color, __RMK_DATE__);
+  }
+  .rmk-item {
+      margin:5px 0 0 0; font-size:0.92rem;
+      color: var(--text-color, __RMK_FG__);
+  }
   .rmk-tag {
-      display:inline-block; background:__TAG_BG__; color:__TAG_FG__;
+      display:inline-block; background:rgba(130,140,155,.22);
+      color: var(--text-color, __TAG_FG__); opacity:.9;
       font-size:0.72rem; font-weight:600; padding:1px 8px;
       border-radius:999px; margin-right:6px;
   }
@@ -534,17 +589,67 @@ daily_df = pd.DataFrame(
 pct = s.cod_pct
 avg = s.total / s.days if s.days else 0
 cal_days = s.calendar_days
+variance = s.total - s.plan
+direct_total = round(sum(r.core_plant_total for r in s.records), 2)
+sales_total = round(sum(r.sales_rakes for r in s.records), 2)
+pellet_total = round(sum(r.pellet_rakes for r in s.records), 2)
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Despatch", f"{s.total:,.0f}")
-c2.metric("COD plan", f"{s.plan:,.2f}")
-c3.metric("Achievement", f"{pct:.1f}%" if pct else "-",
-          delta=f"{s.total - s.plan:+,.1f} rakes" if s.plan else None)
-c4.metric("Days reported", s.days)
-c5.metric("Rakes / day (reported)", f"{avg:,.2f}" if s.days else "-")
-c6.metric("Rakes / day (calendar)",
-          f"{s.total / cal_days:,.2f}" if cal_days else "-")
 
+def block(title: str) -> None:
+    """A small heading above a row of cards, so no figure stands unlabelled."""
+    st.markdown(f'<div class="blk">{title}</div>', unsafe_allow_html=True)
+
+
+def kpi(col, label: str, value, unit: str = "", sub: str = "",
+        tone: str = "flat") -> None:
+    html = [f'<div class="kpi"><div class="kpi-label">{label}</div>',
+            f'<div class="kpi-value">{value}']
+    if unit:
+        html.append(f'<span class="kpi-unit">{unit}</span>')
+    html.append("</div>")
+    if sub:
+        html.append(f'<div class="kpi-sub k-{tone}">{sub}</div>')
+    html.append("</div>")
+    col.markdown("".join(html), unsafe_allow_html=True)
+
+
+block("Despatch against COD plan")
+c1, c2, c3, c4 = st.columns(4)
+kpi(c1, "Total despatch", f"{s.total:,.0f}", "rakes",
+    f"{s.days} day(s) reported")
+kpi(c2, "COD plan", f"{s.plan:,.2f}", "rakes",
+    "sum of the daily plans")
+kpi(c3, "Variance", f"{variance:+,.2f}", "rakes",
+    "ahead of plan" if variance >= 0 else "short of plan",
+    "good" if variance >= 0 else "bad")
+kpi(c4, "Achievement", f"{pct:.1f}%" if pct else "-", "",
+    f"{variance:+,.1f} rakes vs plan" if s.plan else "plan not stated",
+    kind_for(pct) if pct else "flat")
+
+block("Averages per day")
+c5, c6, c7, c8 = st.columns(4)
+kpi(c5, "Days reported", f"{s.days:,}", f"of {cal_days:,} calendar days",
+    "days with a message")
+kpi(c6, "Rakes / day (reported)", f"{avg:,.2f}" if s.days else "-", "rakes",
+    "despatch ÷ days reported")
+kpi(c7, "Rakes / day (calendar)",
+    f"{s.total / cal_days:,.2f}" if cal_days else "-", "rakes",
+    "despatch ÷ calendar days")
+kpi(c8, "Plan / day", f"{s.plan / cal_days:,.2f}" if cal_days else "-",
+    "rakes", "COD plan ÷ calendar days")
+
+block("Where the rakes went")
+c9, c10, c11, c12 = st.columns(4)
+kpi(c9, "Direct to plants", f"{direct_total:,.2f}", "rakes",
+    "BSL, DSP, RSP, ISP, BSP")
+kpi(c10, "Sales", f"{sales_total:,.2f}", "rakes", "sales conversion")
+kpi(c11, "Pellets", f"{pellet_total:,.2f}", "rakes", "pellet conversion")
+conv = round(sales_total + pellet_total, 2)
+kpi(c12, "Conversion share",
+    f"{conv / s.total * 100:,.1f}%" if s.total else "-", "",
+    f"{conv:,.2f} of {s.total:,.0f} rakes")
+
+block("Period highlights")
 bits = [badge(f"{pct:.1f}% of plan" if pct else "plan not stated",
               kind_for(pct))]
 fys = sorted({r.fy for r in s.records})
@@ -738,8 +843,8 @@ with t_matrix:
           empty="No sales or pellets conversion in these messages.")
     if not mine_conv_df.empty and "TOTAL" in set(mine_conv_df["Mine"]):
         body = mine_conv_df[mine_conv_df["Mine"] != "TOTAL"]
-        split_cols = [c for c in ("Excl. Sales & Pellets", "Sales", "Pellets")
-                      if c in body.columns]
+        split_cols = [c for c in ("Excl. Sales & Pellets", "Sales", "Pellets",
+                                  OTHERS_COL) if c in body.columns]
         if split_cols and not body.empty:
             st.caption("Mine wise split, stacked")
             chart(body.set_index("Mine")[split_cols].fillna(0),
@@ -833,7 +938,7 @@ with t_daily:
         for code in picked_mines:
             name = MINE_NAMES.get(code, code)
             keep += [name, f"{name} (excl. S&P)", f"{name} Sales",
-                     f"{name} Pellets", f"{name} Total"]
+                     f"{name} Pellets", f"{name} Others", f"{name} Total"]
         keep += ["Sales", "Pellets", "Total Rakes", "COD Plan"]
         dmv = dmv[[c for c in keep if c in dmv.columns]]
     table(dmv, "Daily Mine Wise", "daily_mine_wise", height=430,
