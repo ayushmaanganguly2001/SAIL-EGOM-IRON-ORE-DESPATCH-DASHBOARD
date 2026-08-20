@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+"""
+SAIL-EGOM-IRON ORE-DESPATCH-DASHBOARD  (Streamlit front end)
+============================================================
+
+Upload the Word (.docx) export of the daily "Despatch Performance" WhatsApp
+messages - or paste them straight in - and get an interactive report.
+
+Reporting conventions
+---------------------
+  * Financial year runs 1 April to 31 March, labelled F.Y.2025-2026.
+  * Q1 of F.Y.2025-2026 is April-2025 to June-2025.
+  * Weeks run strictly Sunday to Saturday and never cross a month boundary.
+  * Monthly rakes/day divides by the calendar days of that month.
+
+Setup (once)
+------------
+    pip install streamlit pandas openpyxl matplotlib
+
+(matplotlib is optional - it only sharpens the Achievement % colour scale.)
+
+Run
+---
+    streamlit run despatch_dashboard.py
+
+Keep despatch_report.py in the same folder; the parser lives there.
+"""
+
+from __future__ import annotations
+
+import io
+import zipfile
+
+import pandas as pd
+import streamlit as st
+
+
+# A Streamlit app must be launched by `streamlit run`. If started with plain
+# `python` (e.g. the VS Code Run button), relaunch ourselves properly.
+def _running_under_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if not _running_under_streamlit():
+    import os
+    import subprocess
+    import sys
+
+    print("Launching the dashboard in your browser via `streamlit run`...\n")
+    try:
+        done = subprocess.run([sys.executable, "-m", "streamlit", "run",
+                               os.path.abspath(__file__)])
+        raise SystemExit(done.returncode)
+    except FileNotFoundError:
+        print("Streamlit is not installed. Run:\n"
+              "    pip install streamlit pandas openpyxl", file=sys.stderr)
+        raise SystemExit(1)
+
+
+st.set_page_config(page_title="SAIL-EGOM-IRON ORE-DESPATCH-DASHBOARD",
+                   page_icon="🚂", layout="wide")
+
+try:
+    from despatch_report import (
+        CORE_PLANTS,
+        MINE_NAMES,
+        MINE_ORDER,
+        SPLIT_MINES,
+        Summary,
+        clean,
+        docx_xml_to_text,
+        fiscal_month_index,
+        fy_quarter,
+        fy_start_year,
+        parse_records,
+        summarise,
+    )
+except ModuleNotFoundError:
+    st.error("**despatch_report.py was not found.**")
+    st.markdown(
+        "This dashboard is only the front end - the message parser lives in "
+        "`despatch_report.py`. Put that file in the same folder as "
+        "`despatch_dashboard.py` and reload this page."
+    )
+    st.stop()
+
+
+MAX_MONTHS = 36
+
+# ---------------------------------------------------------------------------
+# Compatibility, styling and small helpers
+# ---------------------------------------------------------------------------
+
+# Streamlit renamed use_container_width -> width in late 2025; support both.
+try:
+    import inspect
+    FULL = ({"width": "stretch"}
+            if "width" in inspect.signature(st.dataframe).parameters
+            else {"use_container_width": True})
+except Exception:
+    FULL = {"use_container_width": True}
+
+def _dark_theme() -> bool:
+    """Streamlit's active theme, so the custom CSS keeps enough contrast."""
+    try:
+        return str(st.get_option("theme.base") or "light").lower() == "dark"
+    except Exception:
+        return False
+
+
+DARK = _dark_theme()
+
+_PALETTE = {
+    True: {   # dark theme
+        "CARD_BG": "#1b2430", "CARD_BORDER": "#2f3d4d", "ACCENT": "#5b9bd5",
+        "LABEL": "#a3b3c6", "VALUE": "#eaf1f8",
+        "TITLE": "#8fc0ea", "SUB": "#a3b3c6",
+        "GOOD_BG": "#12331f", "GOOD_FG": "#7fe0a1",
+        "WARN_BG": "#382c12", "WARN_FG": "#f0c66b",
+        "BAD_BG": "#3b1a1f", "BAD_FG": "#f59aa1",
+        "FLAT_BG": "#242f3c", "FLAT_FG": "#c5cfdb",
+        "RMK_BG": "#1b2430", "RMK_FG": "#dde5ee", "RMK_DATE": "#8fc0ea",
+        "TAG_BG": "#242f3c", "TAG_FG": "#c5cfdb",
+    },
+    False: {  # light theme
+        "CARD_BG": "#f7f9fc", "CARD_BORDER": "#e3e8ef", "ACCENT": "#3b6ea5",
+        "LABEL": "#5b6b7f", "VALUE": "#12212f",
+        "TITLE": "#1f3d5c", "SUB": "#5b6b7f",
+        "GOOD_BG": "#e3f5e8", "GOOD_FG": "#0a7d28",
+        "WARN_BG": "#fdf3e0", "WARN_FG": "#9a6600",
+        "BAD_BG": "#fdeaea", "BAD_FG": "#b00020",
+        "FLAT_BG": "#eef1f5", "FLAT_FG": "#44546a",
+        "RMK_BG": "#fbfcfe", "RMK_FG": "#2d3a49", "RMK_DATE": "#1f3d5c",
+        "TAG_BG": "#eef1f5", "TAG_FG": "#44546a",
+    },
+}
+
+_CSS = """
+<style>
+  div[data-testid="stMetric"] {
+      background: __CARD_BG__;
+      border: 1px solid __CARD_BORDER__;
+      border-left: 4px solid __ACCENT__;
+      border-radius: 10px;
+      padding: 14px 16px 10px 16px;
+  }
+  div[data-testid="stMetricLabel"] p {
+      font-size: 0.78rem; letter-spacing: .04em;
+      text-transform: uppercase; color: __LABEL__ !important;
+  }
+  div[data-testid="stMetricValue"] {
+      font-size: 1.7rem; color: __VALUE__ !important;
+  }
+  div[data-testid="stMetricValue"] div { color: __VALUE__ !important; }
+  .badge {
+      display:inline-block; padding:3px 12px; border-radius:999px;
+      font-size:0.82rem; font-weight:600; margin-right:8px; margin-bottom:6px;
+  }
+  .b-good { background:__GOOD_BG__; color:__GOOD_FG__; }
+  .b-warn { background:__WARN_BG__; color:__WARN_FG__; }
+  .b-bad  { background:__BAD_BG__;  color:__BAD_FG__; }
+  .b-flat { background:__FLAT_BG__; color:__FLAT_FG__; }
+  h3 { padding-top: .3rem; }
+
+  .egom-title {
+      font-size: 1.75rem; font-weight: 700; letter-spacing: .06em;
+      color: __TITLE__; margin-bottom: 0;
+  }
+  .egom-sub { color:__SUB__; font-size:0.9rem; margin-top:2px; }
+
+  .rmk-card {
+      background:__RMK_BG__; border:1px solid __CARD_BORDER__;
+      border-left:4px solid __ACCENT__;
+      border-radius:8px; padding:10px 14px; margin-bottom:10px;
+  }
+  .rmk-date { font-weight:700; color:__RMK_DATE__; font-size:0.95rem; }
+  .rmk-item { margin:5px 0 0 0; color:__RMK_FG__; font-size:0.92rem; }
+  .rmk-tag {
+      display:inline-block; background:__TAG_BG__; color:__TAG_FG__;
+      font-size:0.72rem; font-weight:600; padding:1px 8px;
+      border-radius:999px; margin-right:6px;
+  }
+</style>
+"""
+
+for _token, _value in _PALETTE[DARK].items():
+    _CSS = _CSS.replace(f"__{_token}__", _value)
+st.markdown(_CSS, unsafe_allow_html=True)
+
+GOOD, WARN = 100.0, 90.0
+
+
+def badge(text: str, kind: str = "flat") -> str:
+    return f'<span class="badge b-{kind}">{text}</span>'
+
+
+def kind_for(pct: float | None) -> str:
+    if not pct:
+        return "flat"
+    return "good" if pct >= GOOD else "warn" if pct >= WARN else "bad"
+
+
+def read_upload(upload) -> str:
+    data = upload.getvalue()
+    if upload.name.lower().endswith(".docx"):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            return docx_xml_to_text(
+                zf.read("word/document.xml").decode("utf-8", "replace"))
+    return data.decode("utf-8", "replace")
+
+
+@st.cache_data(show_spinner=False)
+def parse_cached(blob: str):
+    """Parsing is the slow part; cache it on the raw text."""
+    return parse_records(blob)
+
+
+def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe = name[:31]
+            df.to_excel(writer, sheet_name=safe, index=False)
+            ws = writer.sheets[safe]
+            for col in ws.columns:
+                width = max((len(str(c.value)) for c in col if c.value), default=8)
+                ws.column_dimensions[col[0].column_letter].width = min(width + 3, 45)
+            ws.freeze_panes = "A2"
+    return buf.getvalue()
+
+
+def signed(col):
+    return ["color:#b00020;font-weight:600" if pd.notna(v) and v < 0
+            else "color:#0a7d28" if pd.notna(v) and v > 0 else ""
+            for v in col]
+
+
+def add_gap(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Variance / Achievement % to any Plan-vs-Despatch table."""
+    out = df.copy()
+    if {"COD Plan", "Despatch"} <= set(out.columns):
+        out["Variance"] = (out["Despatch"] - out["COD Plan"]).round(2)
+        out["Achievement %"] = [
+            round(d / p * 100, 1) if p else None
+            for d, p in zip(out["Despatch"], out["COD Plan"])]
+    return out
+
+
+try:                                  # background_gradient needs matplotlib
+    import matplotlib                 # noqa: F401
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+
+def _ach_colour(col):
+    """Stand-in for a colour gradient when matplotlib is not installed."""
+    out = []
+    for v in col:
+        if pd.isna(v):
+            out.append("")
+        elif v >= 100:
+            out.append("background-color:#0a7d28;color:white")
+        elif v >= 90:
+            out.append("background-color:#9a6600;color:white")
+        else:
+            out.append("background-color:#b00020;color:white")
+    return out
+
+
+def perf_styler(df: pd.DataFrame):
+    sty = df.style.format(precision=2, na_rep="-")
+    if "Variance" in df.columns:
+        sty = sty.apply(signed, subset=["Variance"])
+    if "Achievement %" in df.columns:
+        sty = (sty.background_gradient(subset=["Achievement %"], cmap="RdYlGn",
+                                       vmin=60, vmax=120) if HAS_MPL
+               else sty.apply(_ach_colour, subset=["Achievement %"]))
+    return sty
+
+
+@st.cache_data(show_spinner=False)
+def excel_bytes(df: pd.DataFrame, sheet: str) -> bytes:
+    """Cached so a rerun does not rebuild every table's workbook."""
+    return to_excel({sheet: df})
+
+
+def excel_button(df: pd.DataFrame, sheet: str, key: str,
+                 label: str = "Download Excel") -> None:
+    """Every table and every chart's data can be pulled into Excel."""
+    if df is None or df.empty:
+        return
+    try:
+        st.download_button(label, excel_bytes(df, sheet),
+                           file_name=f"{key}.xlsx", key=f"dl_{key}",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet")
+    except ImportError:
+        st.caption("Excel export needs: pip install openpyxl")
+
+
+def table(df: pd.DataFrame, sheet: str, key: str, styler=None,
+          height: int | None = None, empty: str = "Nothing to show.") -> None:
+    """Render a dataframe with its own Excel download."""
+    if df is None or df.empty:
+        st.info(empty)
+        return
+    opts = {"hide_index": True, **FULL}
+    if height:
+        opts["height"] = height
+    if styler is not None:
+        try:
+            st.dataframe(styler(df), **opts)
+        except Exception:
+            st.dataframe(df, **opts)
+    else:
+        st.dataframe(df, **opts)
+    excel_button(df, sheet, key)
+
+
+def chart(df: pd.DataFrame, sheet: str, key: str, kind: str = "line",
+          height: int = 320, empty: str = "Nothing to chart.") -> None:
+    """Render a chart and offer the data behind it as Excel."""
+    if df is None or df.empty:
+        st.info(empty)
+        return
+    fn = {"line": st.line_chart, "bar": st.bar_chart,
+          "area": st.area_chart}[kind]
+    fn(df, height=height)
+    excel_button(df.reset_index(), sheet, key, "Download chart data (Excel)")
+
+
+# ---------------------------------------------------------------------------
+# Header and input
+# ---------------------------------------------------------------------------
+
+st.markdown('<div class="egom-title">SAIL-EGOM-IRON ORE-DESPATCH-DASHBOARD</div>'
+            '<div class="egom-sub">Financial year 1 April to 31 March &middot; '
+            'Q1 = April to June &middot; weeks run Sunday to Saturday</div>',
+            unsafe_allow_html=True)
+st.write("")
+
+with st.sidebar:
+    st.header("1. Load messages")
+    uploads = st.file_uploader("Word or text files", type=["docx", "txt", "md"],
+                               accept_multiple_files=True,
+                               help="One file per month, or several at once.")
+    pasted = st.text_area("...or paste messages here", height=120)
+
+texts: dict[str, str] = {}
+for up in uploads or []:
+    try:
+        texts[up.name] = read_upload(up)
+    except (zipfile.BadZipFile, KeyError):
+        st.error(f"Could not read {up.name} - is it a real .docx?")
+if pasted.strip():
+    texts["pasted text"] = pasted
+
+if not texts:
+    st.info("Upload a Word file or paste messages in the sidebar to begin.")
+    st.stop()
+
+records = parse_cached("\n".join(texts.values()))
+if not records:
+    st.error("No dated records found. Each message needs a date such as "
+             "1-August-2026.")
+    with st.expander("What was read from the file", expanded=True):
+        for name, text in texts.items():
+            st.write(f"**{name}**")
+            st.code("\n".join(clean(text).split("\n")[:60]) or "(empty)")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Filters - financial year, quarter, month (up to 36), day, mine
+# ---------------------------------------------------------------------------
+
+meta: dict[str, dict] = {}
+for r in records:
+    meta.setdefault(r.month_key, {
+        "label": r.month_name,
+        "fy": r.fy,
+        "q": f"Q{fy_quarter(r.day)}",
+        "sort": (fy_start_year(r.day), fiscal_month_index(r.day)),
+    })
+month_keys = sorted(meta, key=lambda k: meta[k]["sort"])
+
+fy_options = sorted({meta[k]["fy"] for k in month_keys})
+q_options = [q for q in ("Q1", "Q2", "Q3", "Q4")
+             if any(meta[k]["q"] == q for k in month_keys)]
+
+with st.sidebar:
+    st.header("2. Period")
+    picked_fy = st.multiselect("Financial year", fy_options,
+                              help="Leave empty for every financial year.")
+    picked_q = st.multiselect("Quarter", q_options,
+                              help="Q1 = Apr-Jun, Q2 = Jul-Sep, "
+                                   "Q3 = Oct-Dec, Q4 = Jan-Mar.")
+
+    candidates = [k for k in month_keys
+                  if (not picked_fy or meta[k]["fy"] in picked_fy)
+                  and (not picked_q or meta[k]["q"] in picked_q)]
+    if not candidates:
+        st.warning("No months match that financial year / quarter.")
+        st.stop()
+
+    disp = {f"{meta[k]['label']}  ({meta[k]['fy']})": k for k in candidates}
+    default = list(disp)[-1:]
+    picked_disp = st.multiselect(f"Months (up to {MAX_MONTHS})", list(disp),
+                                default=default,
+                                help=f"Select as many as you like, up to "
+                                     f"{MAX_MONTHS} months. Leave empty for "
+                                     f"every month in the range above.")
+    picked_months = [disp[d] for d in picked_disp] or candidates
+    if len(picked_months) > MAX_MONTHS:
+        st.warning(f"{len(picked_months)} months selected - showing the most "
+                   f"recent {MAX_MONTHS}.")
+        picked_months = picked_months[-MAX_MONTHS:]
+
+    active_months = [k for k in month_keys if k in set(picked_months)]
+    scope = [r for r in records if r.month_key in set(active_months)]
+
+    st.header("3. Narrow down")
+    day_labels = [r.label for r in scope]
+    picked_days = st.multiselect("Days", day_labels,
+                                 help="Leave empty for every day in range.")
+    if picked_days:
+        scope = [r for r in scope if r.label in picked_days]
+
+    mine_disp = {MINE_NAMES.get(c, c): c for c in MINE_ORDER}
+    picked_mine_names = st.multiselect("Mines", list(mine_disp),
+                                       help="Affects the mine tables only, "
+                                            "not the headline totals.")
+    picked_mines = [mine_disp[n] for n in picked_mine_names]
+
+    st.header("4. Display")
+    ma_window = st.slider("Moving average (days)", 1, 14, 7)
+    show_target = st.checkbox("Show 100% target line", value=True)
+    if st.button("Clear parser cache"):
+        st.cache_data.clear()
+        st.rerun()
+
+if not scope:
+    st.warning("No records match the current filters.")
+    st.stop()
+
+s: Summary = summarise(scope)
+
+# ---------------------------------------------------------------------------
+# Tables built once, reused by tabs and the export
+# ---------------------------------------------------------------------------
+
+mine_df = pd.DataFrame(s.mine_rows())
+if picked_mines and not mine_df.empty:
+    mine_df = mine_df[mine_df["Mine"].isin(picked_mines)]
+
+group_df = add_gap(pd.DataFrame(s.group_rows()))
+plant_df = pd.DataFrame(s.plant_rows())
+pellet_df = pd.DataFrame(s.pellet_account_rows())
+rake_df = pd.DataFrame(s.rake_type_rows(), columns=["Type", "Rakes"])
+
+rt_rows, rt_cols = s.rake_type_matrix()
+rake_matrix_df = pd.DataFrame(rt_rows)
+if not rake_matrix_df.empty:
+    rake_matrix_df = rake_matrix_df[[c for c in rt_cols
+                                     if c in rake_matrix_df.columns]]
+remark_df = pd.DataFrame(s.remark_rows(), columns=["Date", "Remark"])
+
+fy_df = pd.DataFrame(s.fy_rows())
+quarter_df = pd.DataFrame(s.quarter_rows())
+monthly_df = pd.DataFrame(s.monthly_rows())
+weekly_df = pd.DataFrame(s.weekly_rows())
+
+matrix_rows, matrix_cols = s.mine_plant_matrix()
+matrix_df = pd.DataFrame(matrix_rows)
+if not matrix_df.empty:
+    matrix_df = matrix_df[[c for c in matrix_cols if c in matrix_df.columns]]
+
+conv_rows, conv_cols = s.mine_conversion_rows()
+mine_conv_df = pd.DataFrame(conv_rows)
+if not mine_conv_df.empty:
+    mine_conv_df = mine_conv_df[[c for c in conv_cols
+                                 if c in mine_conv_df.columns]]
+
+mpa_rows, mpa_cols = s.mine_pellet_account_rows()
+mine_pellet_df = pd.DataFrame(mpa_rows)
+if not mine_pellet_df.empty:
+    mine_pellet_df = mine_pellet_df[[c for c in mpa_cols
+                                     if c in mine_pellet_df.columns]]
+
+dm_rows, dm_cols = s.daily_mine_rows()
+daily_mine_df = pd.DataFrame(dm_rows)
+if not daily_mine_df.empty:
+    daily_mine_df = daily_mine_df[[c for c in dm_cols
+                                   if c in daily_mine_df.columns]]
+
+dp_rows, dp_cols = s.daily_cod_rows()
+daily_plan_df = pd.DataFrame(dp_rows)
+if not daily_plan_df.empty:
+    daily_plan_df = daily_plan_df[[c for c in dp_cols
+                                   if c in daily_plan_df.columns]]
+
+va_rows, va_cols = s.daily_cod_vs_actual_rows()
+daily_va_df = pd.DataFrame(va_rows)
+if not daily_va_df.empty:
+    daily_va_df = daily_va_df[[c for c in va_cols
+                               if c in daily_va_df.columns]]
+
+notes = s.notes()
+note_df = pd.DataFrame(notes, columns=["Date", "Note"])
+issues = s.issues()
+issue_df = pd.DataFrame(issues, columns=["Date", "Issue"])
+unparsed_df = pd.DataFrame(s.unparsed_rows(), columns=["Date", "Line"])
+
+daily_df = pd.DataFrame(
+    [{"Date": r.label, "Day": r.day_name,
+      "Despatch": r.total, "COD Plan": r.plan,
+      "Variance": round(r.variance, 2),
+      "Achievement %": round(r.achievement, 1) if r.achievement else None,
+      "Direct to Plants": r.core_plant_total,
+      "Sales": r.sales_rakes, "Pellets": r.pellet_rakes,
+      "Cumulative": r.cumulative, "Month Avg": r.mth_avg,
+      "Week": r.week, "Month": r.month_name, "F.Y.": r.fy,
+      "KTR": f"{r.ktr_dest} ({r.ktr_rakes:g})" if r.ktr_dest else ""}
+     for r in s.records])
+
+# ---------------------------------------------------------------------------
+# KPI header
+# ---------------------------------------------------------------------------
+
+pct = s.cod_pct
+avg = s.total / s.days if s.days else 0
+cal_days = s.calendar_days
+
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1.metric("Despatch", f"{s.total:,.0f}")
+c2.metric("COD plan", f"{s.plan:,.2f}")
+c3.metric("Achievement", f"{pct:.1f}%" if pct else "-",
+          delta=f"{s.total - s.plan:+,.1f} rakes" if s.plan else None)
+c4.metric("Days reported", s.days)
+c5.metric("Rakes / day (reported)", f"{avg:,.2f}" if s.days else "-")
+c6.metric("Rakes / day (calendar)",
+          f"{s.total / cal_days:,.2f}" if cal_days else "-")
+
+bits = [badge(f"{pct:.1f}% of plan" if pct else "plan not stated",
+              kind_for(pct))]
+fys = sorted({r.fy for r in s.records})
+bits.append(badge(" + ".join(fys), "flat"))
+bits.append(badge(f"{len(active_months)} month(s) in view", "flat"))
+
+if not daily_df.empty and daily_df["Despatch"].notna().any():
+    best = daily_df.loc[daily_df["Despatch"].idxmax()]
+    worst = daily_df.loc[daily_df["Despatch"].idxmin()]
+    bits.append(badge(f"best {best['Date']}: {best['Despatch']:,.0f}", "good"))
+    bits.append(badge(f"lowest {worst['Date']}: {worst['Despatch']:,.0f}", "bad"))
+
+st.markdown("".join(bits), unsafe_allow_html=True)
+
+st.caption(f"Period {s.records[0].label} to {s.records[-1].label}  ·  "
+           f"{s.days} of {cal_days} calendar days reported"
+           + (f"  ·  cumulative as stated in the last message: "
+              f"{s.stated_cumulative:,.0f} rakes"
+              if s.stated_cumulative else ""))
+
+if issues:
+    st.warning(f"{len(issues)} data check(s) need review - see the "
+               f"**Checks & export** tab.")
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+
+(t_trend, t_period, t_week, t_mine, t_matrix, t_dist, t_daily, t_remarks,
+ t_export) = st.tabs(
+    ["Trend", "Monthly / Quarterly / F.Y.", "Weekly", "Mine wise",
+     "Mine to plant", "Plants & groups", "Daily records", "Remarks",
+     "Checks & export"])
+
+# --- Trend -----------------------------------------------------------------
+with t_trend:
+    st.subheader("Despatch vs COD plan")
+    trend = daily_df.set_index("Date")[["Despatch", "COD Plan"]].copy()
+    if ma_window > 1:
+        trend[f"{ma_window}-day avg"] = (
+            daily_df["Despatch"].rolling(ma_window, min_periods=1)
+            .mean().round(2).values)
+    chart(trend, "Trend", "trend_despatch_plan", "line", 340)
+
+    st.subheader("Achievement %")
+    ach = daily_df.set_index("Date")[["Achievement %"]].copy()
+    if show_target:
+        ach["Target"] = 100
+    chart(ach, "Achievement", "trend_achievement", "line", 260)
+
+    st.subheader("Cumulative progress")
+    cum = pd.DataFrame({"Cumulative": daily_df["Despatch"].cumsum()})
+    if daily_df["COD Plan"].notna().any():
+        cum["Plan (pro rata)"] = daily_df["COD Plan"].cumsum()
+    cum.index = daily_df["Date"]
+    chart(cum, "Cumulative", "trend_cumulative", "area", 300)
+
+# --- Monthly / Quarterly / F.Y. --------------------------------------------
+with t_period:
+    st.subheader("Financial year summary - plan vs actual")
+    st.caption("Financial year runs 1 April to 31 March. The plan is the sum "
+               "of the daily COD plans for the days present in the data, so a "
+               "month with missing messages shows a smaller plan too.")
+    table(fy_df, "FY Summary", "fy_summary", perf_styler,
+          empty="No financial-year rows.")
+
+    st.subheader("Quarterly summary - plan vs actual")
+    st.caption("Q1 = Apr-Jun, Q2 = Jul-Sep, Q3 = Oct-Dec, Q4 = Jan-Mar.")
+    table(quarter_df, "Quarterly", "quarter_summary", perf_styler,
+          empty="No quarterly rows.")
+    if not quarter_df.empty:
+        idx = quarter_df["Quarter"] + " " + quarter_df["F.Y."]
+        chart(quarter_df.assign(Q=idx).set_index("Q")[["COD Plan", "Despatch"]],
+              "Quarterly Chart", "quarter_chart", "bar", 300)
+
+    st.subheader("Monthly summary - plan vs actual and rakes/day")
+    st.caption("Rakes/day (calendar) divides the month's despatch by the "
+               "calendar days of that month; rakes/day (reported) divides by "
+               "the days actually present in the messages.")
+    table(monthly_df, "Monthly", "monthly_summary", perf_styler,
+          empty="No monthly rows.")
+    if not monthly_df.empty:
+        chart(monthly_df.set_index("Month")[["COD Plan", "Despatch"]],
+              "Monthly Chart", "monthly_chart", "bar", 300)
+        st.caption("Rakes per day, monthly")
+        cols = [c for c in ("Rakes/Day (calendar)", "Rakes/Day (reported)")
+                if c in monthly_df.columns]
+        chart(monthly_df.set_index("Month")[cols],
+              "Rakes Per Day", "monthly_rpd", "line", 280)
+
+# --- Weekly ----------------------------------------------------------------
+with t_week:
+    st.subheader("Weekly averages")
+    st.caption("Weeks run strictly Sunday to Saturday and never cross a month "
+               "boundary, so a month starting on a Friday has a two-day first "
+               "week. 'Week Days' is the length of that clipped week; "
+               "'Days Reported' is how many of them appear in the messages.")
+    table(weekly_df, "Weekly", "weekly_summary", perf_styler,
+          empty="No weekly rows.")
+    if not weekly_df.empty:
+        chart(weekly_df.set_index("Week")[["COD Plan", "Despatch"]],
+              "Weekly Chart", "weekly_chart", "bar", 300)
+        st.caption("Average rakes per day, by week")
+        cols = [c for c in ("Avg/Day (week days)", "Avg/Day (reported)")
+                if c in weekly_df.columns]
+        chart(weekly_df.set_index("Week")[cols],
+              "Weekly Averages", "weekly_avg", "line", 280)
+
+# --- Mine wise -------------------------------------------------------------
+with t_mine:
+    st.subheader("Mine wise despatch vs COD plan")
+    st.caption("Order follows EGOM reporting: Manoharpur, Gua, Kiriburu, "
+               "Meghataburu, Bolani, Barsuan, Taldih, Kalta.")
+    if mine_df.empty:
+        st.info("No mine lines matched.")
+    else:
+        left, right = st.columns([1.2, 1])
+        with left:
+            table(mine_df, "Mine Wise", "mine_wise", perf_styler)
+        with right:
+            chart(mine_df.set_index("Name")[["COD Plan", "Despatch"]],
+                  "Mine Chart", "mine_chart", "bar", 360)
+
+        if "Achievement %" in mine_df.columns:
+            ranked = mine_df.copy()
+            ranked["Variance"] = (ranked["Despatch"] - ranked["COD Plan"]).round(2)
+            ranked = ranked.dropna(subset=["Variance"]).sort_values("Variance")
+            if not ranked.empty:
+                st.subheader("Who is pulling the numbers up or down")
+                a, b = st.columns(2)
+                with a:
+                    st.caption("Biggest shortfalls")
+                    table(ranked.head(5)[["Name", "COD Plan", "Despatch",
+                                          "Variance"]],
+                          "Shortfalls", "mine_short", perf_styler)
+                with b:
+                    st.caption("Biggest over-performers")
+                    table(ranked.tail(5).iloc[::-1][["Name", "COD Plan",
+                                                     "Despatch", "Variance"]],
+                          "Over Performers", "mine_over", perf_styler)
+                chart(ranked.set_index("Name")[["Variance"]],
+                      "Mine Variance", "mine_variance", "bar", 320)
+
+# --- Mine to plant ---------------------------------------------------------
+with t_matrix:
+    st.subheader("Mine to plant distribution")
+    st.caption("Rows are mines in EGOM order; columns are the receiving "
+               "plants, then Sales and Pellets. Plant columns are built from "
+               "the destination lines under each mine in the message. "
+               "'Unallocated' is the part of a mine's rakes with no "
+               "destination line on that day.")
+    if picked_mines and not matrix_df.empty and "Mine" in matrix_df.columns:
+        keep = [MINE_NAMES.get(c, c) for c in picked_mines] + ["TOTAL"]
+        view = matrix_df[matrix_df["Mine"].isin(keep)]
+    else:
+        view = matrix_df
+    table(view, "Mine to Plant", "mine_plant_matrix",
+          empty="No mine-to-plant detail found in these messages.")
+
+    st.info(
+        "**How the conversion columns work.** The messages label a mine's "
+        "conversion explicitly, as `Pellets : 1FBSL 1FRSP 2FISP` or "
+        "`Sales: 2F OTH` under the mine, so sales and pellets are reported "
+        "separately per mine. The plant codes on a Pellets line name the "
+        "**plant a/c** the conversion is booked to, not a direct despatch, so "
+        "they are kept out of the plant columns. 'Direct' is the mine's rakes "
+        "that went straight to a plant. Sales and pellets are collapsed into "
+        "one 'others' figure only on the rake-type lines, where the message "
+        "itself writes OTH; an untagged OTH under a mine lands in the Others "
+        "column here.")
+
+    if not matrix_df.empty and "TOTAL" in set(matrix_df["Mine"]):
+        body = matrix_df[matrix_df["Mine"] != "TOTAL"]
+        plant_cols = [c for c in CORE_PLANTS if c in body.columns]
+        if plant_cols and not body.empty:
+            st.caption("Mine to plant, charted")
+            chart(body.set_index("Mine")[plant_cols].fillna(0),
+                  "Mine to Plant Chart", "matrix_chart", "bar", 340)
+
+    st.divider()
+    st.subheader("Mine wise sales and pellets conversion")
+    st.caption("The EGOM four-way split for every mine: rakes excluding sales "
+               "and pellets, then sales, then pellets, then the mine total. "
+               f"{', '.join(MINE_NAMES.get(c, c) for c in SPLIT_MINES)} are "
+               "always reported this way.")
+    conv_view = mine_conv_df
+    if picked_mines and not conv_view.empty and "Mine" in conv_view.columns:
+        keep = [MINE_NAMES.get(c, c) for c in picked_mines] + ["TOTAL"]
+        conv_view = conv_view[conv_view["Mine"].isin(keep)]
+    table(conv_view, "Mine Sales and Pellets", "mine_conversion", perf_styler,
+          empty="No sales or pellets conversion in these messages.")
+    if not mine_conv_df.empty and "TOTAL" in set(mine_conv_df["Mine"]):
+        body = mine_conv_df[mine_conv_df["Mine"] != "TOTAL"]
+        split_cols = [c for c in ("Excl. Sales & Pellets", "Sales", "Pellets")
+                      if c in body.columns]
+        if split_cols and not body.empty:
+            st.caption("Mine wise split, stacked")
+            chart(body.set_index("Mine")[split_cols].fillna(0),
+                  "Mine Split Chart", "mine_split_chart", "bar", 340)
+
+    st.divider()
+    st.subheader("Mine wise pellet conversion by plant a/c")
+    st.caption("Which plant account each mine's pellet rakes were booked to, "
+               "read off the plant codes on the mine's own Pellets line.")
+    table(mine_pellet_df, "Mine Pellet Accounts", "mine_pellet_accounts",
+          empty="No pellet plant a/c named under any mine in these messages.")
+
+# --- Plants & groups -------------------------------------------------------
+with t_dist:
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Group wise")
+        table(group_df, "Group Wise", "group_wise", perf_styler,
+              empty="No group lines found.")
+    with right:
+        st.subheader("Rake types")
+        table(rake_df, "Rake Types", "rake_types", empty="None found.")
+        if not rake_df.empty:
+            chart(rake_df.set_index("Type"), "Rake Types Chart",
+                  "rake_chart", "bar", 260)
+
+    st.subheader("Rake type to plant")
+    st.caption("Read from the plant tags on each rake-type line, e.g. "
+               "Pvt. GPWIS(7) |2OTH|1PBSL|1PRSP|2PISP|1PBSP. A leading P marks "
+               "a private wagon and is not part of the plant code; OTH is "
+               "'others', that is pellets plus sales. 'Unsplit' is any part of "
+               "the bracketed count with no plant tag.")
+    table(rake_matrix_df, "Rake Type to Plant", "rake_type_matrix",
+          empty="No plant tags found on the rake-type lines.")
+    if not rake_matrix_df.empty:
+        rel_cols = [c for c in rake_matrix_df.columns
+                    if c not in ("Rake Type", "Rakes", "Unsplit")]
+        if rel_cols:
+            st.caption("Rake type to plant, stacked by receiving plant")
+            chart(rake_matrix_df.set_index("Rake Type")[rel_cols].fillna(0),
+                  "Rake Type Relation", "rake_relation_chart", "bar", 360)
+
+    st.subheader("Plant wise distribution")
+    st.caption("'Direct' rows are rakes despatched straight to a plant. "
+               "'Conversion' rows are sales and pellets, which together with "
+               "the direct rows make up Total Rakes.")
+    table(plant_df, "Plant Wise", "plant_wise", perf_styler,
+          empty="No plant distribution found.")
+    if not plant_df.empty:
+        chart(plant_df.set_index("Plant")[["COD Plan", "Despatch"]],
+              "Plant Chart", "plant_chart", "bar", 320)
+        if plant_df["Despatch"].sum():
+            share = plant_df.assign(
+                Share=(plant_df["Despatch"] / plant_df["Despatch"].sum() * 100)
+                .round(1))[["Plant", "Share"]]
+            st.caption("Share of despatch (%)")
+            chart(share.set_index("Plant"), "Plant Share", "plant_share",
+                  "bar", 260)
+
+    st.subheader("Pellet conversion by plant a/c")
+    st.caption("Read from the bracket list on the Pellets line, e.g. "
+               "[1FBSL, 1FRSP, 2FISP, 1FBSP].")
+    table(pellet_df, "Pellet Accounts", "pellet_accounts",
+          empty="No pellet plant accounts found in these messages.")
+    if not pellet_df.empty:
+        chart(pellet_df.set_index("Plant a/c")[["Pellet Rakes"]],
+              "Pellet Chart", "pellet_chart", "bar", 260)
+
+# --- Daily records ---------------------------------------------------------
+with t_daily:
+    st.subheader("Daily records")
+    only_miss = st.checkbox("Show only days that missed the plan")
+    view = daily_df[daily_df["Variance"] < 0] if only_miss else daily_df
+    table(view, "Daily", "daily_records", perf_styler, height=430,
+          empty="No days match the current filters.")
+    st.caption(f"{len(view)} of {len(daily_df)} days shown.")
+
+    st.subheader("Daily mine wise despatch")
+    st.caption(
+        "One row per day, one column per mine in EGOM order, followed by "
+        "Sales, Pellets and Total Rakes. "
+        f"{', '.join(MINE_NAMES.get(c, c) for c in SPLIT_MINES)} - and any "
+        "other mine showing conversion - are broken into four columns: "
+        "excluding sales and pellets, then sales, then pellets, then the "
+        "mine's total.")
+    dmv = daily_mine_df
+    if picked_mines and not dmv.empty:
+        # A picked mine may appear either as one column or as the four-way
+        # split, so keep every variant of its name.
+        keep = ["Date", "Day"]
+        for code in picked_mines:
+            name = MINE_NAMES.get(code, code)
+            keep += [name, f"{name} (excl. S&P)", f"{name} Sales",
+                     f"{name} Pellets", f"{name} Total"]
+        keep += ["Sales", "Pellets", "Total Rakes", "COD Plan"]
+        dmv = dmv[[c for c in keep if c in dmv.columns]]
+    table(dmv, "Daily Mine Wise", "daily_mine_wise", height=430,
+          empty="No mine lines found for these days.")
+
+    st.subheader("Daily COD plan, mine wise")
+    st.caption("The plan side of the table above: one row per day, one column "
+               "per mine in EGOM order. 'Mine Total' adds the mine-wise plans "
+               "and 'Stated COD Plan' is the figure given in the message, so "
+               "the two can be compared. The last row totals the period.")
+    dpv = daily_plan_df
+    if picked_mines and not dpv.empty:
+        keep = ["Date", "Day"] + [MINE_NAMES.get(c, c) for c in picked_mines] + \
+               ["Mine Total", "Stated COD Plan"]
+        dpv = dpv[[c for c in keep if c in dpv.columns]]
+    table(dpv, "Daily COD Mine Wise", "daily_cod_mine_wise", height=430,
+          empty="No mine-wise COD plan found in these messages.")
+
+    if not daily_plan_df.empty:
+        body = daily_plan_df[daily_plan_df["Date"] != "TOTAL"]
+        mine_cols = [c for c in body.columns
+                     if c not in ("Date", "Day", "Mine Total",
+                                  "Stated COD Plan")]
+        if mine_cols and body[mine_cols].to_numpy().sum():
+            st.caption("Daily COD plan by mine, stacked")
+            chart(body.set_index("Date")[mine_cols], "Daily COD Chart",
+                  "daily_cod_chart", "bar", 320)
+
+    st.subheader("Daily plan vs actual, mine wise")
+    st.caption("The same two sides put next to each other, one row per mine "
+               "per day, with variance and achievement.")
+    vav = daily_va_df
+    if picked_mines and not vav.empty:
+        names = [MINE_NAMES.get(c, c) for c in picked_mines]
+        vav = vav[vav["Mine"].isin(names)]
+    only_short = st.checkbox("Show only mine-days below plan",
+                             key="va_only_short")
+    if only_short and not vav.empty:
+        vav = vav[vav["Variance"] < 0]
+    table(vav, "Daily COD vs Actual", "daily_cod_vs_actual", perf_styler,
+          height=430, empty="No mine lines with a plan for these days.")
+
+    if not daily_df.empty:
+        st.caption("Daily variance against plan")
+        chart(daily_df.set_index("Date")[["Variance"]], "Daily Variance",
+              "daily_variance", "bar", 280)
+
+# --- Remarks ---------------------------------------------------------------
+with t_remarks:
+    st.subheader("Remarks / reasons")
+    if remark_df.empty:
+        st.info("None found.")
+    else:
+        term = st.text_input("Search remarks", placeholder="e.g. rake, power, "
+                                                           "belt, siding")
+        view = remark_df
+        if term.strip():
+            view = remark_df[remark_df["Remark"]
+                             .str.contains(term.strip(), case=False, na=False)]
+
+        st.caption(f"{len(view)} of {len(remark_df)} remarks shown.")
+        mine_words = {MINE_NAMES.get(c, c): c for c in MINE_ORDER}
+        mine_words.update({"Kuteshwar": "KTR"})
+
+        for day_label, block in view.groupby("Date", sort=False):
+            items = []
+            for text in block["Remark"]:
+                tags = [name for name in mine_words
+                        if name.lower() in str(text).lower()]
+                chips = "".join(f'<span class="rmk-tag">{t}</span>'
+                                for t in tags)
+                items.append(f'<div class="rmk-item">{chips}{text}</div>')
+            st.markdown(
+                f'<div class="rmk-card"><div class="rmk-date">{day_label}'
+                f'</div>{"".join(items)}</div>', unsafe_allow_html=True)
+
+        excel_button(view, "Remarks", "remarks_table")
+
+        with st.expander("Remarks as a table"):
+            st.dataframe(view, hide_index=True, **FULL)
+
+        words = (remark_df["Remark"].str.lower()
+                 .str.findall(r"[a-z]{5,}").explode().dropna())
+        stop = {"rakes", "rake", "today", "despatch", "plan", "against",
+                "total", "mines", "there", "which", "their", "because"}
+        words = words[~words.isin(stop)]
+        if not words.empty:
+            top = words.value_counts().head(12).rename("Mentions")
+            with st.expander("Most frequent words in remarks"):
+                chart(top.to_frame(), "Remark Words", "remark_words", "bar", 280)
+
+# --- Checks & export -------------------------------------------------------
+with t_export:
+    tag = active_months[0] if len(active_months) == 1 else "all"
+    sheets = {
+        "FY Summary": fy_df, "Quarterly": quarter_df, "Monthly": monthly_df,
+        "Weekly": weekly_df, "Daily": daily_df,
+        "Daily Mine Wise": daily_mine_df, "Mine Wise": mine_df,
+        "Mine to Plant": matrix_df,
+        "Mine Sales & Pellets": mine_conv_df, "Plant Wise": plant_df,
+        "Pellet Accounts": pellet_df,
+        "Mine Pellet Accounts": mine_pellet_df, "Group Wise": group_df,
+        "Rake Types": rake_df, "Rake Type to Plant": rake_matrix_df,
+        "Daily COD Mine Wise": daily_plan_df,
+        "Daily COD vs Actual": daily_va_df, "Remarks": remark_df,
+        "Conversion Notes": note_df, "Data Checks": issue_df,
+    }
+    sheets = {k: v for k, v in sheets.items() if v is not None and not v.empty}
+
+    st.subheader("Export everything")
+    d1, d2 = st.columns(2)
+    d1.download_button("Download CSV (daily)",
+                       daily_df.to_csv(index=False).encode(),
+                       file_name=f"despatch_{tag}.csv", mime="text/csv")
+    try:
+        d2.download_button("Download Excel (every table)", to_excel(sheets),
+                           file_name=f"despatch_{tag}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument."
+                                "spreadsheetml.sheet")
+    except ImportError:
+        d2.caption("Excel export needs: pip install openpyxl")
+
+    st.subheader(f"Sales / pellets conversion notes ({len(notes)})")
+    st.caption("Total Rakes is expected to equal direct plant despatch plus "
+               "sales and pellets conversion. Where the direct plant lines "
+               "alone fall short of Total Rakes, the remainder is explained "
+               "here rather than reported as an error.")
+    table(note_df, "Conversion Notes", "conv_notes",
+          empty="No conversion recorded in these messages.")
+
+    st.subheader(f"Data checks ({len(issues)})")
+    st.caption("Each message is checked against itself: do the mine figures "
+               "add up to Total Rakes, does direct plant despatch plus "
+               "conversion match Total Rakes, does the pellet plant a/c detail "
+               "add up to the Pellets line, and does the stated cumulative "
+               "match the running total within the month?")
+    if issues:
+        table(issue_df, "Data Checks", "data_checks")
+    else:
+        st.success("All messages are internally consistent.")
+
+    with st.expander(f"Lines the parser did not recognise "
+                     f"({len(unparsed_df)})"):
+        st.caption("If your messages use a destination format I have not seen, "
+                   "it will show up here. Send me a couple of these lines and "
+                   "I can extend the parser.")
+        table(unparsed_df, "Unparsed", "unparsed_lines",
+              empty="Every line was recognised.")
+
+    with st.expander("Parsing diagnostics"):
+        diag = pd.DataFrame([
+            {"Date": r.label,
+             "Total": r.total or "MISSING", "Plan": r.plan or "MISSING",
+             "Mines": len(r.mines),
+             "Dest lines": sum(len(m.dest) for m in r.mines.values()),
+             "Plants": len(r.plants), "Rake types": len(r.rake_types),
+             "Remarks": len(r.remarks), "Unparsed": len(r.unparsed)}
+            for r in s.records])
+        table(diag, "Diagnostics", "diagnostics")
+
+    with st.expander("Original messages"):
+        for r in s.records:
+            st.markdown(f"**{r.label}**")
+            st.code(r.raw)
