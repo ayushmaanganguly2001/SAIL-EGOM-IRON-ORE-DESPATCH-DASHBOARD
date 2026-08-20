@@ -90,6 +90,8 @@ PLANT_KEYS = CORE_PLANTS + CONVERSION_PLANTS
 # SLS / PLT are honoured too, for the day when a message names them per mine.
 DEST_CODES = set(CORE_PLANTS) | {"OTH", "SLS", "PLT"}
 OTHERS_COL = "Others (pellets + sales)"
+# Conversion rakes whose line names no plant account, e.g. "Pellets : 2F OTH".
+UNNAMED_AC = "A/c not stated"
 
 # Rake types as reported by EGOM, in reporting order.
 RAKE_TYPES = [
@@ -529,11 +531,17 @@ class Record:
 
         # The mine lines and the plant distribution are two statements of the
         # same day, so each side should reconcile with the other.
+        # Rakes a mine tagged only as OTH could be either sales or pellets,
+        # so they excuse a gap on both lines rather than being an error.
+        untagged = round(sum(m.others for m in self.mines.values()), 2)
         for key, attr in (("Sales", "sales"), ("Pellets", "pellets")):
             stated = self.plants.get(key)
+            if not stated:
+                continue
             from_mines = round(sum(getattr(m, attr)
                                    for m in self.mines.values()), 2)
-            if stated and from_mines and abs(from_mines - stated.rakes) > 0.01:
+            gap = round(stated.rakes - from_mines, 2)
+            if abs(gap) > 0.01 and not (0 < gap <= untagged + 0.01):
                 issues.append(f"{key.lower()} under the mines {from_mines:g} != "
                               f"{key} in plant distribution {stated.rakes:g}")
 
@@ -742,6 +750,11 @@ def _build(day: date, label: str, raw: str) -> Record:
                 mine.cod = _num(cod_m.group(1))
             rec.mines[code] = mine
             current = mine
+            # A known mine line means we are back in the mine block, whatever
+            # came before it - otherwise the mine's own "Pellets :" line would
+            # be read as the day's plant-distribution Pellets figure.
+            if code in MINE_NAMES:
+                section = ""
             # Destinations sometimes sit on the mine line itself; ignore the
             # "(Daily COD Plan ...)" tail so the plan is never read as a rake.
             head = s[:cod_m.start()] if cod_m else s
@@ -770,18 +783,19 @@ def _build(day: date, label: str, raw: str) -> Record:
                     fines=_num(m.group(3)), rakes=_num(m.group(4)),
                     cod=_num(cod_m.group(1)) if cod_m else 0.0)
                 continue
-            if PLANT_OTHER_RE.match(s) and COD_INLINE_RE.search(s):
+            if PLANT_OTHER_RE.match(s):
                 key = "Sales" if s.lower().startswith("sale") else "Pellets"
                 cod_m = COD_INLINE_RE.search(s)
                 # Strip the "(Daily COD Plan ...)" part before reading rakes,
-                # so the plan figure is never mistaken for the actual.
-                head = s[:cod_m.start()]
+                # so the plan figure is never mistaken for the actual. The
+                # plan is often absent on these two lines, so do not require it.
+                head = s[:cod_m.start()] if cod_m else s
                 head = head.rsplit("(", 1)[0] if "(" in head[-30:] else head
                 nums = RAKES_RE.findall(head)
                 rec.plants[key] = Plant(
                     code=key,
                     rakes=_num(nums[-1]) if nums else _bracket_sum(head),
-                    cod=_num(cod_m.group(1)),
+                    cod=_num(cod_m.group(1)) if cod_m else 0.0,
                     accounts=_bracket_accounts(head))
                 continue
 
@@ -1108,12 +1122,22 @@ class Summary:
                        if any((m := r.mines.get(c)) and m.conversion
                               for r in self.records)}
 
+        # An untagged OTH under a mine is conversion of an unstated kind. It
+        # only gets a column where it actually occurs, so the four columns
+        # still add up to the mine's total.
+        has_others = {c for c in codes
+                      if any((m := r.mines.get(c)) and m.others
+                             for r in self.records)}
+
         cols: list[str] = []
         for code in codes:
             name = MINE_NAMES.get(code, code)
             if code in broken:
                 cols += [f"{name} (excl. S&P)", f"{name} Sales",
-                         f"{name} Pellets", f"{name} Total"]
+                         f"{name} Pellets"]
+                if code in has_others:
+                    cols.append(f"{name} Others")
+                cols.append(f"{name} Total")
             else:
                 cols.append(name)
 
@@ -1127,6 +1151,8 @@ class Summary:
                     row[f"{name} (excl. S&P)"] = mine.direct if mine else 0
                     row[f"{name} Sales"] = mine.sales if mine else 0
                     row[f"{name} Pellets"] = mine.pellets if mine else 0
+                    if code in has_others:
+                        row[f"{name} Others"] = mine.others if mine else 0
                     row[f"{name} Total"] = mine.rakes if mine else 0
                 else:
                     row[name] = mine.rakes if mine else 0
@@ -1955,6 +1981,15 @@ def selftest() -> int:
           {"Mine": "Bolani", "BSL": 1.0, "RSP": 1.0, "ISP": 2.0,
            "Pellet Rakes": 4.0})
     check("pellet a/c total", pa_rows[-1]["Pellet Rakes"], 5.0)
+    check("pellet a/c has no unnamed col", UNNAMED_AC in pa_cols, False)
+
+    # A pellets line naming no plant a/c must still add up, so it gets its own
+    # column rather than quietly inflating the Pellet Rakes total.
+    m = Mine("BOL")
+    _add_conversion(m, "pellets", " 2F OTH")
+    check("unnamed pellet a/c", m.pellet_accounts, {"OTH": 2.0})
+    check("unnamed pellets counted", m.pellets, 2.0)
+    check("unnamed a/c not a plant", m.dest, {})
 
     rows, cols = s.daily_mine_rows()
     check("daily mine row count", len(rows), 1)
